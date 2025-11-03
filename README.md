@@ -41,6 +41,9 @@ watchtower-telegram-monitor/
 | `MONITORED_CONTAINERS` | 监控容器列表(空=全部) | - | ❌ |
 
 
+
+
+
 ## 📖 详细文档
 
 - [安装指南](docs/INSTALL.md)
