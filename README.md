@@ -11,7 +11,7 @@
 
 ### 🚀 快速开始
 
-本项目使用 Docker Compose 部署。克隆仓库后，修改 `.env.example` 文件，即可一键启动。
+本项目使用 Docker Compose 部署。
 
 ### 📦 仓库结构速览
 
