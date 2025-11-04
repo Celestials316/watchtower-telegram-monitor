@@ -85,7 +85,7 @@ mkdir -p /opt/watchtower && cd /opt/watchtower
 
 ```bash
 # 下载 docker-compose.yml
-curl -o docker-compose.yml https://raw.githubusercontent.com/w254992/watchtower-telegram-monitor/main/docker/docker-compose.yml
+curl -o docker-compose.yml https://raw.githubusercontent.com/Celestials316/watchtower-telegram-monitor/main/docker/docker-compose.yml
 
 # 如果 GitHub 访问较慢，使用代理或手动创建（见下方）
 ```
@@ -303,7 +303,7 @@ docker logs watchtower-notifier
 #### 步骤 1: 克隆仓库
 
 ```bash
-git clone https://github.com/w254992/watchtower-telegram-monitor.git
+git clone https://github.com/Celestials316/watchtower-telegram-monitor.git
 cd watchtower-telegram-monitor
 ```
 
@@ -960,11 +960,11 @@ services:
 - 📖 查看 [README.md](../README.md) 了解功能特性
 - ⚙️ 查看 [CONFIGURATION.md](CONFIGURATION.md) 了解高级配置
 - 🐛 遇到问题？查看 [FAQ.md](FAQ.md)
-- 💬 加入 [讨论区](https://github.com/w254992/watchtower-telegram-monitor/discussions)
+- 💬 加入 [讨论区](https://github.com/Celestials316/watchtower-telegram-monitor/discussions)
 
 ---
 
 **安装过程中遇到问题？**
 
-- 🐛 [提交 Issue](https://github.com/w254992/watchtower-telegram-monitor/issues/new)
-- 💬 [讨论区求助](https://github.com/w254992/watchtower-telegram-monitor/discussions)
+- 🐛 [提交 Issue](https://github.com/Celestials316/watchtower-telegram-monitor/issues/new)
+- 💬 [讨论区求助](https://github.com/Celestials316/watchtower-telegram-monitor/discussions)
