@@ -535,7 +535,11 @@ get_danmu_version() {
     fi
 
     version=$(docker exec "$container_name" cat /app/danmu_api/configs/globals.js 2>/dev/null | \
-              grep -m 1 "VERSION:" | sed -E "s/.*VERSION: '([^']+)'.*/\1/" 2>/dev/null || echo "")
+              grep -m 1 "VERSION:" | sed -E "s/.*VERSION: '([^']+)'.*/\1/" 2>/dev/null)
+    
+    if [ -z "$version" ]; then
+        version=""
+    fi
 
     echo "$version"
 }
