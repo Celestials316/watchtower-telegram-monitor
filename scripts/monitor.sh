@@ -935,16 +935,18 @@ cleanup_old_states() {
         return
     fi
 
-    cutoff_time=$(( $(date +%s) - 604800 ))
+    cutoff_time=$(( $(date +%s) - 604800 ))  # 一周前的时间戳
     temp_file="${STATE_FILE}.tmp"
 
-    : > "$temp_file"
+    : > "$temp_file"  # 清空临时文件
 
     if [ -s "$STATE_FILE" ]; then
         while IFS='|' read -r container image_tag image_id version_info timestamp || [ -n "$container" ]; do
-            [ -z "$container" ] && continue
+            [ -z "$container" ] && continue  # 如果 container 为空则跳过
 
-            if echo "$timestamp" | grep -qE '^[0-9]+; then
+            # 先判断 timestamp 是否是数字
+            if echo "$timestamp" | grep -qE '^[0-9]+$'; then
+                # 再判断 timestamp 是否大于等于 cutoff_time
                 if [ "$timestamp" -ge "$cutoff_time" ]; then
                     echo "$container|$image_tag|$image_id|$version_info|$timestamp" >> "$temp_file"
                 fi
@@ -952,6 +954,7 @@ cleanup_old_states() {
         done < "$STATE_FILE"
     fi
 
+    # 如果临时文件存在，替换原文件
     if [ -f "$temp_file" ]; then
         mv "$temp_file" "$STATE_FILE" 2>/dev/null || rm -f "$temp_file"
     fi
