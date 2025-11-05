@@ -534,8 +534,9 @@ get_danmu_version() {
         done
     fi
 
+    # 使用基础正则避免括号问题
     version=$(docker exec "$container_name" cat /app/danmu_api/configs/globals.js 2>/dev/null | \
-              grep -m 1 "VERSION:" | sed -E "s/.*VERSION: '([^']+)'.*/\1/" 2>/dev/null)
+              grep -m 1 "VERSION:" | sed "s/.*VERSION: '\([^']*\)'.*/\1/" 2>/dev/null)
     
     if [ -z "$version" ]; then
         version=""
