@@ -27,15 +27,20 @@ services:
         max-file: "3"
     healthcheck:
       test: ["CMD", "sh", "-c", "ps aux | grep -v grep | grep -q watchtower"]
-      interval: 30s
-      timeout: 10s
+      interval: 30秒
+      timeout: 10秒
       retries: 3
-      start_period: 10s
+      start_period: 10秒
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
+    # 如果只监控特定容器，取消下面的注释并添加容器名
+    # command:
+    #   - nginx
+    #   - mysql
+    #   - redis
 
   watchtower-notifier:
-    image: w254992/watchtower-telegram-monitor:latest 
+    image: Celestials316/watchtower-telegram-monitor:latest
     container_name: watchtower-notifier
     restart: unless-stopped
     network_mode: host
@@ -45,14 +50,53 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./data:/data
-    env_file:
-      - .env
+      - ./monitor.sh:/app/monitor.sh:ro
     environment:
       - TZ=Asia/Shanghai
+      # ============================================
+      # 必填配置 - 请替换为你的实际值
+      # ============================================
+      - BOT_TOKEN=your_bot_token_here
+      - CHAT_ID=your_chat_id_here
+      
+      # ============================================
+      # 可选配置
+      # ============================================
+      # 服务器名称（用于区分多台服务器的通知）
+      - SERVER_NAME=
+      
+      # 检查间隔（秒）
+      # 1800 = 30分钟, 3600 = 1小时, 21600 = 6小时
+      - POLL_INTERVAL=${POLL_INTERVAL:-3600}
+      
+      # 是否自动清理旧镜像 (true/false)
+      - CLEANUP=${CLEANUP:-true}
+      
+      # 是否启用自动回滚 (true/false)
+      - ENABLE_ROLLBACK=${ENABLE_ROLLBACK:-true}
+      
+      # 监控的容器列表（留空表示监控所有）
+      - MONITORED_CONTAINERS=${MONITORED_CONTAINERS:-}
+      
+      # ============================================
+      # 代理配置（国内服务器必需）
+      # ============================================
+      # 如果在中国大陆，需要配置代理访问 Telegram
+      # 取消下面的注释并替换为实际代理地址
+      # - HTTP_PROXY=http://127.0.0.1:7890
+      # - HTTPS_PROXY=http://127.0.0.1:7890
+      # - NO_PROXY=localhost,127.0.0.1
+      
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "ps aux | grep -v grep | grep -q 'command_listener'"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
