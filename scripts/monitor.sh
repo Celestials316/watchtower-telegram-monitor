@@ -1,44 +1,16 @@
 #!/bin/sh
-# Docker 容器监控通知服务 v3.4.0 - 支持 Telegram 命令交互
-# 新增功能: /check, /status, /config, /containers, /interval, /help
+# Docker 容器监控通知服务 v3.3.0
+# 监控 Watchtower 日志并发送 Telegram 通知
 
 echo "正在安装依赖..."
 apk add --no-cache curl docker-cli coreutils grep sed tzdata jq >/dev/null 2>&1
 
-TELEGRAM_API="https://api.telegram.org/bot${BOT_TOKEN}"
+TELEGRAM_API="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
 STATE_FILE="/data/container_state.db"
-CONFIG_FILE="/data/bot_config.conf"
-LAST_UPDATE_ID_FILE="/data/last_update_id"
+TEMP_LOG="/tmp/watchtower_events.log"
 
 # 确保数据目录存在
 mkdir -p /data
-
-# 初始化配置文件
-if [ ! -f "$CONFIG_FILE" ]; then
-    cat > "$CONFIG_FILE" << EOF
-POLL_INTERVAL=${POLL_INTERVAL:-3600}
-MONITORED_CONTAINERS=${MONITORED_CONTAINERS:-}
-ENABLE_ROLLBACK=${ENABLE_ROLLBACK:-true}
-AUTO_CHECK_ENABLED=true
-EOF
-fi
-
-# 加载配置
-load_config() {
-    if [ -f "$CONFIG_FILE" ]; then
-        . "$CONFIG_FILE"
-    fi
-}
-
-# 保存配置
-save_config() {
-    cat > "$CONFIG_FILE" << EOF
-POLL_INTERVAL=${POLL_INTERVAL}
-MONITORED_CONTAINERS=${MONITORED_CONTAINERS}
-ENABLE_ROLLBACK=${ENABLE_ROLLBACK}
-AUTO_CHECK_ENABLED=${AUTO_CHECK_ENABLED}
-EOF
-}
 
 if [ -n "$SERVER_NAME" ]; then
     SERVER_TAG="<b>[${SERVER_NAME}]</b> "
@@ -48,26 +20,16 @@ fi
 
 send_telegram() {
     message="$1"
-    reply_to="${2:-}"
     max_retries=3
     retry=0
     wait_time=5
 
     while [ $retry -lt $max_retries ]; do
-        if [ -n "$reply_to" ]; then
-            response=$(curl -s -w "\n%{http_code}" -X POST "$TELEGRAM_API/sendMessage" \
-                --data-urlencode "chat_id=${CHAT_ID}" \
-                --data-urlencode "text=${SERVER_TAG}${message}" \
-                --data-urlencode "parse_mode=HTML" \
-                --data-urlencode "reply_to_message_id=${reply_to}" \
-                --connect-timeout 10 --max-time 30 2>&1)
-        else
-            response=$(curl -s -w "\n%{http_code}" -X POST "$TELEGRAM_API/sendMessage" \
-                --data-urlencode "chat_id=${CHAT_ID}" \
-                --data-urlencode "text=${SERVER_TAG}${message}" \
-                --data-urlencode "parse_mode=HTML" \
-                --connect-timeout 10 --max-time 30 2>&1)
-        fi
+        response=$(curl -s -w "\n%{http_code}" -X POST "$TELEGRAM_API" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${SERVER_TAG}${message}" \
+            --data-urlencode "parse_mode=HTML" \
+            --connect-timeout 10 --max-time 30 2>&1)
         
         curl_exit_code=$?
         http_code=$(echo "$response" | tail -n1)
@@ -79,16 +41,28 @@ send_telegram() {
             if echo "$body" | grep -q '"ok":true'; then
                 echo "  ✓ Telegram 通知发送成功"
                 return 0
+            else
+                error_desc=$(echo "$body" | sed -n 's/.*"description":"\([^"]*\)".*/\1/p')
+                echo "  ✗ Telegram API 错误: ${error_desc:-未知错误}" >&2
+                
+                if echo "$error_desc" | grep -qiE "chat not found|bot was blocked|user is deactivated"; then
+                    echo "  ✗ 致命错误，停止重试" >&2
+                    return 1
+                fi
             fi
+        else
+            echo "  ✗ HTTP 请求失败 (状态码: $http_code)" >&2
         fi
 
         retry=$((retry + 1))
         if [ $retry -lt $max_retries ]; then
+            echo "  ↻ ${wait_time}秒后重试 ($retry/$max_retries)..." >&2
             sleep $wait_time
             wait_time=$((wait_time * 2))
         fi
     done
 
+    echo "  ✗ Telegram 通知最终失败 (已重试 $max_retries 次)" >&2
     return 1
 }
 
@@ -96,334 +70,6 @@ get_time() { date '+%Y-%m-%d %H:%M:%S'; }
 get_image_name() { echo "$1" | sed 's/:.*$//'; }
 get_short_id() { echo "$1" | sed 's/sha256://' | head -c 12 || echo "unknown"; }
 
-# 获取 Telegram 更新
-get_updates() {
-    last_update_id=0
-    if [ -f "$LAST_UPDATE_ID_FILE" ]; then
-        last_update_id=$(cat "$LAST_UPDATE_ID_FILE")
-    fi
-    
-    offset=$((last_update_id + 1))
-    updates=$(curl -s "$TELEGRAM_API/getUpdates?offset=$offset&timeout=5" 2>/dev/null)
-    
-    if [ $? -eq 0 ] && [ -n "$updates" ]; then
-        echo "$updates"
-    fi
-}
-
-# 处理命令
-process_command() {
-    cmd="$1"
-    msg_id="$2"
-    user_id="$3"
-    
-    # 验证用户权限
-    if [ "$user_id" != "$CHAT_ID" ]; then
-        send_telegram "⛔ 无权限执行命令" "$msg_id"
-        return
-    fi
-    
-    case "$cmd" in
-        /start|/help)
-            help_msg="🤖 <b>Docker 监控 Bot 命令列表</b>
-
-<b>📊 状态查询</b>
-/status - 查看服务状态
-/containers - 列出所有容器
-/config - 查看当前配置
-
-<b>🔄 操作命令</b>
-/check - 立即检查更新
-/update - 强制更新指定容器
-/pause - 暂停自动检查
-/resume - 恢复自动检查
-
-<b>⚙️ 配置命令</b>
-/interval &lt;秒&gt; - 设置检查间隔
-  示例: /interval 1800
-
-/monitor &lt;容器名&gt; - 设置监控容器
-  示例: /monitor nginx mysql
-  留空监控所有: /monitor all
-
-/rollback on|off - 开关自动回滚
-
-<b>📝 其他</b>
-/logs - 查看最近日志
-/help - 显示此帮助
-
-当前版本: v3.4.0"
-            send_telegram "$help_msg" "$msg_id"
-            ;;
-            
-        /status)
-            load_config
-            container_count=$(docker ps --format '{{.Names}}' | grep -vE '^watchtower|^watchtower-notifier$' | wc -l)
-            watchtower_status=$(docker inspect -f '{{.State.Status}}' watchtower 2>/dev/null || echo "unknown")
-            
-            status_msg="📊 <b>服务状态</b>
-
-━━━━━━━━━━━━━━━━━━━━
-🎯 <b>监控服务</b>
-   状态: <code>$([ "$watchtower_status" = "running" ] && echo "运行中 ✅" || echo "已停止 ❌")</code>
-   自动检查: <code>$([ "$AUTO_CHECK_ENABLED" = "true" ] && echo "已启用 ✅" || echo "已暂停 ⏸️")</code>
-
-📦 <b>容器监控</b>
-   容器数: <code>$container_count</code>
-   检查间隔: <code>$((POLL_INTERVAL / 60)) 分钟</code>
-
-🔄 <b>功能状态</b>
-   自动回滚: <code>$([ "$ENABLE_ROLLBACK" = "true" ] && echo "已启用 ✅" || echo "已禁用 ❌")</code>
-   自动清理: <code>$([ "$CLEANUP" = "true" ] && echo "已启用 ✅" || echo "已禁用 ❌")</code>
-
-⏰ <b>服务器时间</b>
-   <code>$(get_time)</code>
-━━━━━━━━━━━━━━━━━━━━"
-            send_telegram "$status_msg" "$msg_id"
-            ;;
-            
-        /containers)
-            containers=$(docker ps --format '{{.Names}}|||{{.Image}}|||{{.Status}}' | grep -vE '^watchtower' | head -20)
-            
-            if [ -z "$containers" ]; then
-                send_telegram "📦 当前没有运行中的容器" "$msg_id"
-                return
-            fi
-            
-            containers_msg="📦 <b>运行中的容器</b>
-
-━━━━━━━━━━━━━━━━━━━━"
-            
-            echo "$containers" | while IFS='|||' read -r name image status; do
-                containers_msg="$containers_msg
-🔹 <code>$name</code>
-   镜像: <code>$image</code>
-   状态: $status
-"
-            done
-            
-            count=$(echo "$containers" | wc -l)
-            containers_msg="$containers_msg
-━━━━━━━━━━━━━━━━━━━━
-共 <b>$count</b> 个容器"
-            
-            send_telegram "$containers_msg" "$msg_id"
-            ;;
-            
-        /config)
-            load_config
-            
-            if [ -n "$MONITORED_CONTAINERS" ]; then
-                monitor_info="特定容器: <code>$MONITORED_CONTAINERS</code>"
-            else
-                monitor_info="所有容器"
-            fi
-            
-            config_msg="⚙️ <b>当前配置</b>
-
-━━━━━━━━━━━━━━━━━━━━
-🕐 <b>检查间隔</b>
-   <code>$((POLL_INTERVAL / 60))</code> 分钟 (<code>${POLL_INTERVAL}秒</code>)
-
-📦 <b>监控范围</b>
-   $monitor_info
-
-🔄 <b>功能开关</b>
-   自动回滚: <code>$([ "$ENABLE_ROLLBACK" = "true" ] && echo "✅ 已启用" || echo "❌ 已禁用")</code>
-   自动清理: <code>$([ "$CLEANUP" = "true" ] && echo "✅ 已启用" || echo "❌ 已禁用")</code>
-   自动检查: <code>$([ "$AUTO_CHECK_ENABLED" = "true" ] && echo "✅ 已启用" || echo "⏸️ 已暂停")</code>
-━━━━━━━━━━━━━━━━━━━━
-
-使用 /help 查看配置命令"
-            send_telegram "$config_msg" "$msg_id"
-            ;;
-            
-        /check)
-            send_telegram "🔄 正在手动检查更新..." "$msg_id"
-            
-            # 触发 watchtower 立即检查
-            docker kill -s SIGHUP watchtower 2>/dev/null || {
-                send_telegram "❌ 触发检查失败，Watchtower 可能未运行" "$msg_id"
-                return
-            }
-            
-            send_telegram "✅ 已触发检查，请稍候查看结果" "$msg_id"
-            ;;
-            
-        /pause)
-            load_config
-            AUTO_CHECK_ENABLED=false
-            save_config
-            send_telegram "⏸️ 自动检查已暂停
-
-使用 /resume 恢复自动检查
-使用 /check 可手动触发检查" "$msg_id"
-            ;;
-            
-        /resume)
-            load_config
-            AUTO_CHECK_ENABLED=true
-            save_config
-            send_telegram "▶️ 自动检查已恢复
-
-检查间隔: <code>$((POLL_INTERVAL / 60))</code> 分钟" "$msg_id"
-            ;;
-            
-        /interval*)
-            new_interval=$(echo "$cmd" | awk '{print $2}')
-            
-            if [ -z "$new_interval" ] || ! echo "$new_interval" | grep -qE '^[0-9]+$'; then
-                send_telegram "❌ 请提供有效的秒数
-
-用法: /interval &lt;秒&gt;
-示例:
-  /interval 1800  (30分钟)
-  /interval 3600  (1小时)
-  /interval 21600 (6小时)" "$msg_id"
-                return
-            fi
-            
-            if [ "$new_interval" -lt 300 ]; then
-                send_telegram "⚠️ 间隔不能小于 300 秒 (5分钟)" "$msg_id"
-                return
-            fi
-            
-            load_config
-            old_interval=$POLL_INTERVAL
-            POLL_INTERVAL=$new_interval
-            save_config
-            
-            # 更新 Watchtower 环境变量（需要重启容器才能生效）
-            send_telegram "✅ 检查间隔已更新
-
-旧值: <code>$((old_interval / 60))</code> 分钟
-新值: <code>$((new_interval / 60))</code> 分钟
-
-⚠️ <b>注意</b>: 需要重启服务才能生效
-命令: <code>docker compose restart</code>" "$msg_id"
-            ;;
-            
-        /monitor*)
-            containers=$(echo "$cmd" | cut -d' ' -f2-)
-            
-            if [ -z "$containers" ] || [ "$containers" = "/monitor" ]; then
-                send_telegram "❌ 请指定容器名称
-
-用法: /monitor &lt;容器名&gt; [容器名2...]
-示例:
-  /monitor nginx mysql redis
-  /monitor all  (监控所有)" "$msg_id"
-                return
-            fi
-            
-            load_config
-            
-            if [ "$containers" = "all" ]; then
-                MONITORED_CONTAINERS=""
-                save_config
-                send_telegram "✅ 已设置为监控所有容器
-
-⚠️ 需要重启服务才能生效" "$msg_id"
-            else
-                MONITORED_CONTAINERS="$containers"
-                save_config
-                send_telegram "✅ 监控容器已更新
-
-监控列表: <code>$containers</code>
-
-⚠️ 需要重启服务才能生效
-并修改 docker-compose.yml 的 command 部分" "$msg_id"
-            fi
-            ;;
-            
-        /rollback*)
-            switch=$(echo "$cmd" | awk '{print $2}')
-            
-            if [ "$switch" != "on" ] && [ "$switch" != "off" ]; then
-                send_telegram "❌ 用法: /rollback on|off
-
-示例:
-  /rollback on  - 启用自动回滚
-  /rollback off - 禁用自动回滚" "$msg_id"
-                return
-            fi
-            
-            load_config
-            
-            if [ "$switch" = "on" ]; then
-                ENABLE_ROLLBACK=true
-                save_config
-                send_telegram "✅ 自动回滚已启用
-
-更新失败时将自动恢复旧版本" "$msg_id"
-            else
-                ENABLE_ROLLBACK=false
-                save_config
-                send_telegram "⚠️ 自动回滚已禁用
-
-更新失败时需要手动处理" "$msg_id"
-            fi
-            ;;
-            
-        /logs)
-            logs=$(docker logs watchtower --tail 20 2>&1 | tail -10)
-            
-            logs_msg="📝 <b>最近日志</b> (最后10行)
-
-━━━━━━━━━━━━━━━━━━━━
-<code>$logs</code>
-━━━━━━━━━━━━━━━━━━━━
-
-查看完整日志:
-<code>docker logs watchtower</code>"
-            
-            send_telegram "$logs_msg" "$msg_id"
-            ;;
-            
-        *)
-            send_telegram "❌ 未知命令: <code>$cmd</code>
-
-使用 /help 查看可用命令" "$msg_id"
-            ;;
-    esac
-}
-
-# 命令监听后台任务
-command_listener() {
-    echo "启动命令监听器..."
-    
-    while true; do
-        updates=$(get_updates)
-        
-        if [ -n "$updates" ] && echo "$updates" | grep -q '"ok":true'; then
-            # 解析每个更新
-            echo "$updates" | jq -r '.result[] | @base64' 2>/dev/null | while read -r update; do
-                decoded=$(echo "$update" | base64 -d 2>/dev/null)
-                
-                update_id=$(echo "$decoded" | jq -r '.update_id' 2>/dev/null)
-                message=$(echo "$decoded" | jq -r '.message.text // empty' 2>/dev/null)
-                msg_id=$(echo "$decoded" | jq -r '.message.message_id // empty' 2>/dev/null)
-                user_id=$(echo "$decoded" | jq -r '.message.from.id // empty' 2>/dev/null)
-                
-                if [ -n "$message" ] && [ -n "$update_id" ]; then
-                    echo "[$(date '+%H:%M:%S')] 收到命令: $message (来自: $user_id)"
-                    
-                    # 保存最新的 update_id
-                    echo "$update_id" > "$LAST_UPDATE_ID_FILE"
-                    
-                    # 处理命令
-                    if echo "$message" | grep -q '^/'; then
-                        process_command "$message" "$msg_id" "$user_id"
-                    fi
-                fi
-            done
-        fi
-        
-        sleep 2
-    done
-}
-
-# 其他函数保持不变（从原 monitor.sh 复制）
 get_danmu_version() {
     container_name="$1"
     check_running="${2:-true}"
@@ -511,12 +157,39 @@ get_container_state() {
     echo "$state" | cut -d'|' -f2,3,4
 }
 
+rollback_container() {
+    container="$1"
+    old_tag="$2"
+    old_id="$3"
+
+    echo "  → 正在执行回滚操作..."
+
+    config=$(docker inspect "$container" 2>/dev/null)
+    if [ -z "$config" ]; then
+        echo "  ✗ 无法获取容器配置，回滚失败"
+        return 1
+    fi
+
+    docker stop "$container" >/dev/null 2>&1 || true
+    docker rm "$container" >/dev/null 2>&1 || true
+
+    echo "  → 尝试使用旧镜像 $old_id 重启容器..."
+
+    docker tag "$old_id" "${old_tag}-rollback" 2>/dev/null || {
+        echo "  ✗ 旧镜像不存在，无法回滚"
+        return 1
+    }
+
+    echo "  ✓ 回滚操作已触发，请手动检查容器状态"
+    return 0
+}
+
 cleanup_old_states() {
     if [ ! -f "$STATE_FILE" ]; then
         return
     fi
 
-    cutoff_time=$(( $(date +%s) - 604800 ))
+    cutoff_time=$(( $(date +%s) - 604800 ))  # 7天前
     temp_file="${STATE_FILE}.tmp"
 
     : > "$temp_file"
@@ -540,14 +213,13 @@ cleanup_old_states() {
 }
 
 echo "=========================================="
-echo "Docker 容器监控通知服务 v3.4.0"
-echo "支持 Telegram 命令交互"
+echo "Docker 容器监控通知服务 v3.3.0"
 echo "服务器: ${SERVER_NAME:-N/A}"
 echo "启动时间: $(get_time)"
+echo "回滚功能: ${ENABLE_ROLLBACK:-false}"
 echo "=========================================="
 echo ""
 
-load_config
 cleanup_old_states
 
 echo "正在等待 watchtower 容器完全启动..."
@@ -583,19 +255,50 @@ done
 container_count=$(docker ps --format '{{.Names}}' | grep -vE '^watchtower|^watchtower-notifier$' | wc -l)
 echo "初始化完成，已记录 ${container_count} 个容器状态"
 
+sleep 3
+
+monitored_containers=$(docker exec watchtower ps aux 2>/dev/null | \
+    grep "watchtower" | \
+    grep -v "grep" | \
+    sed 's/.*watchtower//' | \
+    tr ' ' '\n' | \
+    grep -v "^$" | \
+    grep -v "^--" | \
+    tail -n +2 || true)
+
+if [ -z "$monitored_containers" ]; then
+    monitored_containers=$(docker container inspect watchtower --format='{{range .Args}}{{println .}}{{end}}' 2>/dev/null | \
+        grep -v "^--" | \
+        grep -v "^$" || true)
+fi
+
+if [ -n "$monitored_containers" ]; then
+    container_count=$(echo "$monitored_containers" | wc -l)
+    monitor_list="<b>监控容器列表:</b>"
+    for c in $monitored_containers; do
+        monitor_list="$monitor_list
+   • <code>$c</code>"
+    done
+else
+    container_count=$(docker ps --format '{{.Names}}' | grep -vE "^watchtower$|^watchtower-notifier$" | wc -l)
+    monitor_list="<b>监控范围:</b> 全部容器"
+fi
+
 startup_message="🚀 <b>监控服务启动成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📊 <b>服务信息</b>
-   版本: <code>v3.4.0</code> (支持命令)
+   版本: <code>v3.3.0</code>
 
 🎯 <b>监控状态</b>
    容器数: <code>${container_count}</code>
-   检查间隔: <code>$((POLL_INTERVAL / 60))分钟</code>
+   状态库: <code>已初始化</code>
 
-🤖 <b>交互命令</b>
-   发送 /help 查看命令列表
-   发送 /status 查看状态
+${monitor_list}
+
+🔄 <b>功能配置</b>
+   自动回滚: <code>${ENABLE_ROLLBACK:-禁用}</code>
+   检查间隔: <code>$((POLL_INTERVAL / 60))分钟</code>
 
 ⏰ <b>启动时间</b>
    <code>$(get_time)</code>
@@ -605,23 +308,17 @@ startup_message="🚀 <b>监控服务启动成功</b>
 
 send_telegram "$startup_message"
 
-# 在后台启动命令监听器
-command_listener &
-LISTENER_PID=$!
-
-echo "命令监听器已启动 (PID: $LISTENER_PID)"
 echo "开始监控 Watchtower 日志..."
 
 cleanup() {
     echo "收到退出信号，正在清理..."
-    kill $LISTENER_PID 2>/dev/null
     rm -f /tmp/session_data.txt
     exit 0
 }
 
 trap cleanup INT TERM
 
-# 主循环保持不变（监控更新逻辑）
+# 主循环 - 直接处理，不使用管道
 docker logs -f --tail 0 watchtower 2>&1 | while IFS= read -r line; do
     echo "[$(date '+%H:%M:%S')] $line"
 
@@ -653,10 +350,16 @@ docker logs -f --tail 0 watchtower 2>&1 | while IFS= read -r line; do
         if [ "$updated" -gt 0 ] && [ -f /tmp/session_data.txt ]; then
             echo "[$(date '+%H:%M:%S')] → 发现 ${updated} 处更新，立即处理..."
             
+            echo "[$(date '+%H:%M:%S')] → 会话数据:"
+            while IFS='|' read -r c_name old_tag old_id old_ver; do
+                echo "[$(date '+%H:%M:%S')]     $c_name | $old_tag"
+            done < /tmp/session_data.txt
+            
             while IFS='|' read -r container_name old_tag_full old_id_full old_version_info; do
                 [ -z "$container_name" ] && continue
                 
                 echo "[$(date '+%H:%M:%S')] → 处理容器: $container_name"
+                echo "[$(date '+%H:%M:%S')]   → 等待容器更新完成..."
                 sleep 5
                 
                 for i in $(seq 1 60); do
@@ -676,7 +379,26 @@ docker logs -f --tail 0 watchtower 2>&1 | while IFS= read -r line; do
                 new_version_info=""
                 if echo "$container_name" | grep -qE "danmu-api|danmu_api"; then
                     if [ "$status" = "true" ]; then
-                        new_version_info=$(get_danmu_version "$container_name" "true")
+                        echo "[$(date '+%H:%M:%S')]   → 读取 danmu-api 版本..."
+                        for retry in 1 2; do
+                            for i in $(seq 1 30); do
+                                if docker exec "$container_name" test -f /app/danmu_api/configs/globals.js 2>/dev/null; then
+                                    break
+                                fi
+                                sleep 1
+                            done
+                            
+                            new_version_info=$(docker exec "$container_name" cat /app/danmu_api/configs/globals.js 2>/dev/null | \
+                                             grep -m 1 "VERSION:" | sed -E "s/.*VERSION: '([^']+)'.*/\1/" 2>/dev/null || echo "")
+                            
+                            if [ -n "$new_version_info" ]; then
+                                echo "[$(date '+%H:%M:%S')]   → 检测到版本: v${new_version_info}"
+                                break
+                            elif [ $retry -eq 1 ]; then
+                                echo "[$(date '+%H:%M:%S')]   → 首次读取失败，5秒后重试..."
+                                sleep 5
+                            fi
+                        done
                     fi
                 fi
                 
