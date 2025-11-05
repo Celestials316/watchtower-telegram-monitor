@@ -40,7 +40,7 @@ services:
     #   - redis
 
   watchtower-notifier:
-    image: Celestials316/watchtower-telegram-monitor:latest
+    image: w254992/watchtower-telegram-monitor:latest
     container_name: watchtower-notifier
     restart: unless-stopped
     network_mode: host
