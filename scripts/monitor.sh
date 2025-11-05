@@ -290,7 +290,7 @@ execute_check_command() {
 # 执行 list 命令
 execute_list_command() {
     msg_id="$1"
-    containers=$(docker ps --format '{{.Names}}|||{{.Image}}|||{{.Status}}' | grep -vE '^watchtower' | head -20)
+    containers=$(docker ps --format '{{.Names}}|@|{{.Image}}|@|{{.Status}}' | grep -vE '^watchtower' | head -20)
 
     if [ -z "$containers" ]; then
         send_telegram "📦 当前没有运行中的容器" "$msg_id"
@@ -301,7 +301,7 @@ execute_list_command() {
 
 ━━━━━━━━━━━━━━━━━━━━"
 
-    echo "$containers" | while IFS='|||' read -r name image status; do
+    echo "$containers" | while IFS='|' read -r name sep1 image sep2 status; do
         short_image=$(echo "$image" | sed 's/:latest$//' | head -c 30)
         containers_msg="$containers_msg
 🔹 <b>$name</b>
