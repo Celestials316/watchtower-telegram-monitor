@@ -1,7 +1,7 @@
 # Docker 容器监控系统 v3.4.0
 
-[![Docker Pulls](https://img.shields.io/docker/pulls/Celestials316/watchtower-telegram-monitor)](https://hub.docker.com/r/Celestials316/watchtower-telegram-monitor)
-[![Docker Image Size](https://img.shields.io/docker/image-size/Celestials316/watchtower-telegram-monitor)](https://hub.docker.com/r/Celestials316/watchtower-telegram-monitor)
+[![Docker Pulls](https://img.shields.io/docker/pulls/w254992/watchtower-telegram-monitor)](https://hub.docker.com/r/w254992/watchtower-telegram-monitor)
+[![Docker Image Size](https://img.shields.io/docker/image-size/w254992/watchtower-telegram-monitor)](https://hub.docker.com/r/w254992/watchtower-telegram-monitor)
 [![GitHub Stars](https://img.shields.io/github/stars/Celestials316/watchtower-telegram-monitor?style=social)](https://github.com/Celestials316/watchtower-telegram-monitor)
 
 自动监控 Docker 容器更新并通过 Telegram 发送**中文通知**，支持版本追踪、自动回滚、**Telegram 命令交互**。
