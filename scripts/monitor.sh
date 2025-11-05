@@ -285,35 +285,63 @@ execute_check_command() {
     msg_id="$1"
     send_telegram "🔄 正在手动检查更新，请稍候..." "$msg_id"
 
-    # 方式1：使用 --run-once 在新容器中执行检查（推荐）
-    check_output=$(docker run --rm \
-        -v /var/run/docker.sock:/var/run/docker.sock \
-        containrrr/watchtower:latest \
-        --run-once \
-        --cleanup \
-        --include-restarting \
-        2>&1)
+    # 后台执行检查，避免阻塞
+    (
+        echo "[$(date '+%H:%M:%S')] 开始执行手动检查..."
+        
+        # 使用 --run-once 在新容器中执行检查
+        check_output=$(timeout 300 docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            containrrr/watchtower:latest \
+            --run-once \
+            --cleanup \
+            --include-restarting \
+            --include-stopped=false \
+            2>&1)
+        
+        check_exit=$?
+        echo "[$(date '+%H:%M:%S')] 检查命令退出码: $check_exit"
 
-    # 解析结果
-    updated=$(echo "$check_output" | grep -o "Updated=[0-9]*" | grep -o "[0-9]*" || echo "0")
-    failed=$(echo "$check_output" | grep -o "Failed=[0-9]*" | grep -o "[0-9]*" || echo "0")
-    scanned=$(echo "$check_output" | grep -o "Scanned=[0-9]*" | grep -o "[0-9]*" || echo "0")
+        # 解析结果
+        if [ $check_exit -eq 124 ]; then
+            send_telegram "⚠️ 检查超时（5分钟）
 
-    if [ "$updated" -gt 0 ]; then
-        send_telegram "✅ 检查完成
+可能网络较慢，请稍后再试" "$msg_id"
+            return
+        fi
+
+        if [ $check_exit -ne 0 ]; then
+            send_telegram "❌ 检查执行失败
+
+退出码: $check_exit
+请查看日志排查问题" "$msg_id"
+            return
+        fi
+
+        updated=$(echo "$check_output" | grep -o "Updated=[0-9]*" | grep -o "[0-9]*" | head -1 || echo "0")
+        failed=$(echo "$check_output" | grep -o "Failed=[0-9]*" | grep -o "[0-9]*" | head -1 || echo "0")
+        scanned=$(echo "$check_output" | grep -o "Scanned=[0-9]*" | grep -o "[0-9]*" | head -1 || echo "0")
+
+        echo "[$(date '+%H:%M:%S')] 检查结果: Scanned=$scanned, Updated=$updated, Failed=$failed"
+
+        if [ "$updated" -gt 0 ]; then
+            send_telegram "✅ 检查完成
 
 📊 扫描: ${scanned} 个容器
 ✨ 更新: ${updated} 个容器
 ❌ 失败: ${failed} 个
 
 请等待更新完成的详细通知..." "$msg_id"
-    else
-        send_telegram "✅ 检查完成
+        else
+            send_telegram "✅ 检查完成
 
 📊 扫描: ${scanned} 个容器
 ✨ 所有容器都是最新版本
 ❌ 失败: ${failed} 个" "$msg_id"
-    fi
+        fi
+    ) &
+    
+    echo "[$(date '+%H:%M:%S')] 检查任务已在后台启动 (PID: $!)"
 }
 
 # 执行 list 命令
