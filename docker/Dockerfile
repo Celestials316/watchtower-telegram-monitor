@@ -1,8 +1,8 @@
 FROM alpine:3.19
 
-LABEL maintainer="Your Name <your.email@example.com>" \
-      description="Docker container monitoring with Telegram notifications" \
-      version="3.3.0"
+LABEL maintainer="Celestials316" \
+      description="Docker container monitoring with Telegram notifications and command interaction" \
+      version="3.4.0"
 
 # 安装依赖
 RUN apk add --no-cache \
@@ -32,13 +32,9 @@ RUN chmod +x /app/*.sh
 # 创建数据目录
 RUN mkdir -p /data
 
-# 健康检查
+# 健康检查 - 检查命令监听器是否运行
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=15s \
-    CMD ps aux | grep -v grep | grep -q 'docker logs' || exit 1
-
-# 设置入口点
-ENTRYPOINT ["/bin/bash"]
-CMD ["/app/monitor.sh"]    CMD ps aux | grep -v grep | grep -q 'command_listener' || exit 1
+    CMD ps aux | grep -v grep | grep -q 'command_listener' || exit 1
 
 # 设置入口点
 ENTRYPOINT ["/bin/bash"]
