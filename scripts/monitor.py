@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Docker 容器监控通知服务 v5.3.0
-- 添加主服务器优先协调机制
-- 实现单容器更新功能
-- 优化启动响应速度
+Docker 容器监控通知服务 v5.3.1
+- 修复主服务器判断逻辑
+- 修复回调处理竞争条件
+- 优化服务器协调机制
 """
 
 import os
@@ -23,7 +23,7 @@ from pathlib import Path
 
 # ==================== 配置和常量 ====================
 
-VERSION = "5.3.0"
+VERSION = "5.3.1"
 TELEGRAM_API = f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN')}"
 CHAT_ID = os.getenv('CHAT_ID')
 SERVER_NAME = os.getenv('SERVER_NAME')
@@ -159,6 +159,7 @@ class CommandCoordinator:
         self.primary_server = primary_server
         self.registry_file = registry_file
         self.is_primary = (server_name == primary_server)
+        logger.info(f"协调器初始化: 当前={server_name}, 主服务器={primary_server}, 是否主服务器={self.is_primary}")
 
     def should_handle_command(self, command: str, callback_data: str = None) -> bool:
         """判断当前服务器是否应该处理该命令或回调"""
@@ -196,7 +197,9 @@ class CommandCoordinator:
         non_server_callbacks = ['monitor_action', 'cancel']
         if action in non_server_callbacks:
             coordinator = self._get_coordinator()
-            return self.server_name == coordinator
+            is_coordinator = (self.server_name == coordinator)
+            logger.info(f"回调 {action}: 协调者={coordinator}, 当前={self.server_name}, 处理={is_coordinator}")
+            return is_coordinator
 
         # 包含服务器信息的回调 - 由目标服务器处理
         if len(parts) >= 2:
@@ -214,21 +217,39 @@ class CommandCoordinator:
 
         # 默认：让协调者处理
         coordinator = self._get_coordinator()
-        return self.server_name == coordinator
+        is_coordinator = (self.server_name == coordinator)
+        logger.info(f"回调 {action} (默认): 协调者={coordinator}, 当前={self.server_name}, 处理={is_coordinator}")
+        return is_coordinator
 
     def _get_coordinator(self) -> str:
         """获取协调者（优先使用主服务器）"""
-        servers = self._get_active_servers()
+        registry = safe_read_json(self.registry_file, default={})
         
-        if not servers:
+        if not registry:
+            logger.debug(f"注册表为空，使用当前服务器: {self.server_name}")
             return self.server_name
         
-        # 如果主服务器在线，使用主服务器
-        if self.primary_server in servers:
+        current_time = time.time()
+        active_servers = []
+        
+        # 获取所有活跃服务器
+        for server, info in registry.items():
+            if current_time - info.get('last_heartbeat', 0) < 90:
+                active_servers.append(server)
+        
+        if not active_servers:
+            logger.debug(f"没有活跃服务器，使用当前服务器: {self.server_name}")
+            return self.server_name
+        
+        # 如果主服务器在线且活跃，使用主服务器
+        if self.primary_server in active_servers:
+            logger.debug(f"主服务器 {self.primary_server} 活跃，作为协调者")
             return self.primary_server
         
         # 否则使用字母顺序第一个
-        return sorted(servers)[0]
+        coordinator = sorted(active_servers)[0]
+        logger.debug(f"主服务器不活跃，使用备用协调者: {coordinator}")
+        return coordinator
 
     def _get_active_servers(self) -> List[str]:
         """获取活跃的服务器列表"""
@@ -646,10 +667,11 @@ class ConfigManager:
 class ServerRegistry:
     """服务器注册中心"""
 
-    def __init__(self, registry_file: Path, server_name: str, is_primary: bool):
+    def __init__(self, registry_file: Path, server_name: str, primary_server: str):
         self.registry_file = registry_file
         self.server_name = server_name
-        self.is_primary = is_primary
+        self.primary_server = primary_server
+        self.is_primary = (server_name == primary_server)
         self.heartbeat_interval = 30
         self.timeout = 90
 
@@ -659,10 +681,11 @@ class ServerRegistry:
         registry[self.server_name] = {
             'last_heartbeat': time.time(),
             'version': VERSION,
-            'is_primary': self.is_primary
+            'is_primary': self.is_primary,
+            'primary_server': self.primary_server
         }
         if safe_write_json(self.registry_file, registry):
-            role = "主服务器" if self.is_primary else "从服务器"
+            role = "主服务器 🌟" if self.is_primary else "从服务器"
             logger.info(f"服务器已注册: {self.server_name} ({role})")
         else:
             logger.error(f"服务器注册失败: {self.server_name}")
@@ -672,6 +695,8 @@ class ServerRegistry:
         registry = safe_read_json(self.registry_file, default={})
         if self.server_name in registry:
             registry[self.server_name]['last_heartbeat'] = time.time()
+            registry[self.server_name]['is_primary'] = self.is_primary
+            registry[self.server_name]['primary_server'] = self.primary_server
             safe_write_json(self.registry_file, registry)
 
     def get_active_servers(self) -> List[str]:
@@ -843,7 +868,17 @@ class CommandHandler:
     def handle_help(self):
         """处理 /help 命令"""
         servers = self.registry.get_active_servers()
-        server_list = "\n".join([f"   • <code>{s}</code>" for s in servers])
+        
+        # 获取注册信息，标记主服务器
+        registry = safe_read_json(self.registry.registry_file, default={})
+        server_lines = []
+        for s in servers:
+            info = registry.get(s, {})
+            is_primary = info.get('is_primary', False)
+            marker = " 🌟" if is_primary else ""
+            server_lines.append(f"   • <code>{s}</code>{marker}")
+        
+        server_list = "\n".join(server_lines)
 
         help_msg = f"""📖 <b>命令帮助</b>
 
