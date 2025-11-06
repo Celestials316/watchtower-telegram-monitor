@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Docker 容器监控通知服务 v5.1.0
-修复多服务器重复响应问题
+Docker 容器监控通知服务 v5.2.0
+修复多服务器响应和回调处理问题
 """
 
 import os
@@ -20,7 +20,7 @@ from pathlib import Path
 
 # ==================== 配置和常量 ====================
 
-VERSION = "5.1.0"
+VERSION = "5.2.0"
 TELEGRAM_API = f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN')}"
 CHAT_ID = os.getenv('CHAT_ID')
 SERVER_NAME = os.getenv('SERVER_NAME')
@@ -30,7 +30,6 @@ DATA_DIR = Path("/data")
 STATE_FILE = DATA_DIR / "container_state.json"
 MONITOR_CONFIG = DATA_DIR / "monitor_config.json"
 SERVER_REGISTRY = DATA_DIR / "server_registry.json"
-COMMAND_LOCK = DATA_DIR / "command.lock"
 
 # 确保数据目录存在
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -51,61 +50,102 @@ shutdown_flag = threading.Event()
 
 class CommandCoordinator:
     """命令协调器 - 防止多服务器重复响应"""
-    
-    def __init__(self, server_name: str, registry_file: Path, lock_file: Path):
+
+    def __init__(self, server_name: str, registry_file: Path):
         self.server_name = server_name
         self.registry_file = registry_file
-        self.lock_file = lock_file
-        self.lock_timeout = 5
-    
-    def should_handle_command(self, command: str) -> bool:
-        """判断当前服务器是否应该处理该命令"""
-        # 不需要协调的命令（服务器特定命令）
-        server_specific = ['status_detail', 'update_detail', 'restart_detail']
-        if any(cmd in command for cmd in server_specific):
-            return True
+
+    def should_handle_command(self, command: str, callback_data: str = None) -> bool:
+        """判断当前服务器是否应该处理该命令或回调"""
         
+        # 如果是回调数据，检查是否包含服务器标识
+        if callback_data:
+            return self._should_handle_callback(callback_data)
+        
+        # 不需要协调的命令（全局命令，需要所有服务器响应）
+        global_commands = ['/start']
+        if any(command.startswith(cmd) for cmd in global_commands):
+            return True
+
         # 需要协调的命令
-        coordinated_commands = ['/status', '/update', '/restart', '/monitor', '/help', '/start']
+        coordinated_commands = ['/status', '/update', '/restart', '/monitor', '/help']
         if not any(command.startswith(cmd) for cmd in coordinated_commands):
             return True
-        
+
         # 获取活跃服务器列表
         servers = self._get_active_servers()
         if not servers:
             return True
-        
+
         # 如果只有当前服务器，直接处理
         if len(servers) == 1 and servers[0] == self.server_name:
             return True
-        
+
         # 多服务器情况：选择协调者（按字母顺序第一个）
         coordinator = sorted(servers)[0]
         is_coordinator = (self.server_name == coordinator)
-        
+
         if is_coordinator:
-            logger.info(f"✓ 当前服务器是协调者，处理命令: {command}")
+            logger.info(f"✓ 作为协调者处理命令: {command}")
         else:
-            logger.info(f"✗ 非协调者，忽略命令: {command} (协调者: {coordinator})")
-        
+            logger.info(f"✗ 非协调者忽略命令: {command} (协调者: {coordinator})")
+
         return is_coordinator
-    
+
+    def _should_handle_callback(self, callback_data: str) -> bool:
+        """判断是否应该处理回调"""
+        # 解析回调数据
+        parts = callback_data.split(':')
+        action = parts[0]
+        
+        # 不包含服务器信息的回调，需要协调
+        non_server_callbacks = ['monitor_action', 'cancel']
+        if action in non_server_callbacks:
+            servers = self._get_active_servers()
+            if len(servers) <= 1:
+                return True
+            coordinator = sorted(servers)[0]
+            return self.server_name == coordinator
+        
+        # 包含服务器信息的回调
+        if len(parts) >= 2:
+            if action in ['status_srv', 'update_srv', 'restart_srv', 'monitor_srv']:
+                # 第二个参数是服务器名
+                target_server = parts[1]
+                should_handle = (target_server == self.server_name)
+                logger.info(f"回调目标服务器: {target_server}, 当前服务器: {self.server_name}, 处理: {should_handle}")
+                return should_handle
+            
+            if action in ['update_cnt', 'restart_cnt', 'confirm_restart', 'add_mon', 'rem_mon']:
+                # 第二个参数是服务器名
+                target_server = parts[1]
+                should_handle = (target_server == self.server_name)
+                logger.info(f"回调目标服务器: {target_server}, 当前服务器: {self.server_name}, 处理: {should_handle}")
+                return should_handle
+        
+        # 默认：让协调者处理
+        servers = self._get_active_servers()
+        if len(servers) <= 1:
+            return True
+        coordinator = sorted(servers)[0]
+        return self.server_name == coordinator
+
     def _get_active_servers(self) -> List[str]:
         """获取活跃的服务器列表"""
         if not self.registry_file.exists():
             return [self.server_name]
-        
+
         try:
             with open(self.registry_file, 'r', encoding='utf-8') as f:
                 registry = json.load(f)
-            
+
             current_time = time.time()
             active_servers = []
-            
+
             for server, info in registry.items():
                 if current_time - info.get('last_heartbeat', 0) < 90:
                     active_servers.append(server)
-            
+
             return sorted(active_servers) if active_servers else [self.server_name]
         except Exception as e:
             logger.error(f"读取注册表失败: {e}")
@@ -422,18 +462,16 @@ class CommandHandler:
     """命令处理器"""
 
     def __init__(self, bot: TelegramBot, docker: DockerManager, 
-                 config: ConfigManager, registry: ServerRegistry,
-                 coordinator: CommandCoordinator):
+                 config: ConfigManager, registry: ServerRegistry):
         self.bot = bot
         self.docker = docker
         self.config = config
         self.registry = registry
-        self.coordinator = coordinator
 
     def handle_status(self, chat_id: str):
         """处理 /status 命令"""
         servers = self.registry.get_active_servers()
-        
+
         # 多服务器：显示选择菜单
         if len(servers) > 1:
             buttons = {
@@ -445,13 +483,15 @@ class CommandHandler:
             self.bot.send_message("📊 <b>选择要查看状态的服务器：</b>", buttons)
         else:
             # 单服务器：直接显示状态
-            self._show_server_status(chat_id, SERVER_NAME)
+            self._show_server_status(chat_id, servers[0] if servers else SERVER_NAME)
 
     def _show_server_status(self, chat_id: str, server: str):
         """显示指定服务器的状态"""
+        # 只有目标服务器才执行
         if server != SERVER_NAME:
+            logger.info(f"状态查询目标是 {server}，当前是 {SERVER_NAME}，跳过")
             return
-        
+
         all_containers = self.docker.get_all_containers()
         monitored = [c for c in all_containers if self.config.is_monitored(c)]
         excluded = self.config.get_excluded_containers()
@@ -509,9 +549,11 @@ class CommandHandler:
 
     def _show_update_containers(self, chat_id: str, server: str):
         """显示可更新的容器列表"""
+        # 只有目标服务器才执行
         if server != SERVER_NAME:
+            logger.info(f"更新目标是 {server}，当前是 {SERVER_NAME}，跳过")
             return
-        
+
         containers = [c for c in self.docker.get_all_containers() 
                      if self.config.is_monitored(c)]
 
@@ -551,9 +593,11 @@ class CommandHandler:
 
     def _show_restart_containers(self, chat_id: str, server: str):
         """显示可重启的容器列表"""
+        # 只有目标服务器才执行
         if server != SERVER_NAME:
+            logger.info(f"重启目标是 {server}，当前是 {SERVER_NAME}，跳过")
             return
-        
+
         containers = self.docker.get_all_containers()
 
         if not containers:
@@ -619,6 +663,8 @@ class CommandHandler:
         parts = callback_data.split(':')
         action = parts[0]
 
+        logger.info(f"处理回调: {callback_data}")
+
         if action == 'status_srv':
             server = parts[1]
             self.bot.answer_callback(callback_query_id, f"正在获取 {server} 状态...")
@@ -629,6 +675,19 @@ class CommandHandler:
             self.bot.answer_callback(callback_query_id, "正在加载容器列表...")
             self._show_update_containers(chat_id, server)
 
+        elif action == 'update_cnt':
+            server, container = parts[1], parts[2]
+            if server != SERVER_NAME:
+                logger.info(f"更新容器目标是 {server}，当前是 {SERVER_NAME}，跳过")
+                return
+
+            self.bot.answer_callback(callback_query_id, "正在准备更新...")
+            # TODO: 实现容器更新逻辑
+            self.bot.edit_message(
+                chat_id, message_id,
+                f"⚠️ 容器更新功能开发中\n\n服务器: <code>{server}</code>\n容器: <code>{container}</code>"
+            )
+
         elif action == 'restart_srv':
             server = parts[1]
             self.bot.answer_callback(callback_query_id, "正在加载容器列表...")
@@ -637,6 +696,7 @@ class CommandHandler:
         elif action == 'restart_cnt':
             server, container = parts[1], parts[2]
             if server != SERVER_NAME:
+                logger.info(f"重启目标是 {server}，当前是 {SERVER_NAME}，跳过")
                 return
 
             confirm_msg = f"""⚠️ <b>确认重启</b>
@@ -661,6 +721,7 @@ class CommandHandler:
         elif action == 'confirm_restart':
             server, container = parts[1], parts[2]
             if server != SERVER_NAME:
+                logger.info(f"确认重启目标是 {server}，当前是 {SERVER_NAME}，跳过")
                 return
 
             self.bot.answer_callback(callback_query_id, "开始重启容器...")
@@ -694,10 +755,12 @@ class CommandHandler:
         elif action == 'monitor_action':
             action_type = parts[1]
             if action_type == 'list':
+                self.bot.answer_callback(callback_query_id, "正在查看列表...")
                 self.handle_status(chat_id)
             else:
                 servers = self.registry.get_active_servers()
                 if len(servers) == 1:
+                    self.bot.answer_callback(callback_query_id, "正在加载...")
                     self._handle_monitor_server(
                         chat_id, message_id, action_type, servers[0]
                     )
@@ -710,6 +773,7 @@ class CommandHandler:
                         ]
                     }
                     action_text = "添加监控" if action_type == "add" else "移除监控"
+                    self.bot.answer_callback(callback_query_id, f"选择服务器...")
                     self.bot.edit_message(
                         chat_id, message_id,
                         f"📡 <b>{action_text}</b>\n\n请选择服务器：",
@@ -724,6 +788,7 @@ class CommandHandler:
         elif action == 'add_mon':
             server, container = parts[1], parts[2]
             if server != SERVER_NAME:
+                logger.info(f"添加监控目标是 {server}，当前是 {SERVER_NAME}，跳过")
                 return
 
             self.config.remove_excluded(container)
@@ -743,6 +808,7 @@ class CommandHandler:
         elif action == 'rem_mon':
             server, container = parts[1], parts[2]
             if server != SERVER_NAME:
+                logger.info(f"移除监控目标是 {server}，当前是 {SERVER_NAME}，跳过")
                 return
 
             self.config.add_excluded(container)
@@ -766,7 +832,9 @@ class CommandHandler:
     def _handle_monitor_server(self, chat_id: str, message_id: str, 
                                action: str, server: str):
         """处理监控服务器选择"""
+        # 只有目标服务器才执行
         if server != SERVER_NAME:
+            logger.info(f"监控管理目标是 {server}，当前是 {SERVER_NAME}，跳过")
             return
 
         if action == 'add':
@@ -841,17 +909,27 @@ class BotPoller(threading.Thread):
                 for update in updates:
                     self.last_update_id = update.get('update_id', self.last_update_id)
 
+                    # 处理普通消息
                     message = update.get('message', {})
                     text = message.get('text', '')
                     chat_id = str(message.get('chat', {}).get('id', ''))
 
                     if text and chat_id == CHAT_ID:
+                        # 检查是否应该处理此命令
                         if self.coordinator.should_handle_command(text):
                             self._handle_command(text, chat_id)
+                        else:
+                            logger.info(f"跳过命令处理: {text}")
 
+                    # 处理回调查询
                     callback_query = update.get('callback_query', {})
                     if callback_query:
-                        self._handle_callback(callback_query)
+                        callback_data = callback_query.get('data', '')
+                        # 检查是否应该处理此回调
+                        if self.coordinator.should_handle_command(None, callback_data):
+                            self._handle_callback(callback_query)
+                        else:
+                            logger.info(f"跳过回调处理: {callback_data}")
 
             except Exception as e:
                 logger.error(f"轮询错误: {e}")
@@ -1185,11 +1263,11 @@ def main():
     docker = DockerManager()
     config = ConfigManager(MONITOR_CONFIG, SERVER_NAME)
     registry = ServerRegistry(SERVER_REGISTRY, SERVER_NAME)
-    coordinator = CommandCoordinator(SERVER_NAME, SERVER_REGISTRY, COMMAND_LOCK)
+    coordinator = CommandCoordinator(SERVER_NAME, SERVER_REGISTRY)
 
     registry.register()
 
-    handler = CommandHandler(bot, docker, config, registry, coordinator)
+    handler = CommandHandler(bot, docker, config, registry)
 
     bot_poller = BotPoller(handler, bot, coordinator)
     bot_poller.start()
@@ -1231,11 +1309,11 @@ def main():
    /monitor - 监控管理
    /help - 显示帮助
 
-💡 <b>修复内容 v5.1.0</b>
-   • 修复多服务器重复响应
-   • 添加命令协调机制
-   • 优化消息显示逻辑
-   • 改进服务器选择流程
+💡 <b>修复内容 v5.2.0</b>
+   • 修复多服务器重复响应问题
+   • 修复回调处理逻辑
+   • 优化服务器选择流程
+   • 确保只有目标服务器响应操作
 
 ⏰ <b>启动时间</b>
    <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
