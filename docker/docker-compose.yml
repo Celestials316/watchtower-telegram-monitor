@@ -11,13 +11,13 @@ services:
     environment:
       - WATCHTOWER_NOTIFICATIONS=
       - WATCHTOWER_NO_STARTUP_MESSAGE=true
-      - TZ=Asia/Shanghai
+      - TZ=${TZ:-Asia/Shanghai}
       - WATCHTOWER_CLEANUP=${CLEANUP:-true}
       - WATCHTOWER_INCLUDE_RESTARTING=true
       - WATCHTOWER_INCLUDE_STOPPED=false
       - WATCHTOWER_NO_RESTART=false
       - WATCHTOWER_TIMEOUT=10s
-      - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-3600}
+      - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-1800}
       - WATCHTOWER_DEBUG=false
       - WATCHTOWER_LOG_LEVEL=info
     logging:
@@ -35,10 +35,7 @@ services:
       - "com.centurylinklabs.watchtower.enable=false"
 
   watchtower-notifier:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: watchtower-telegram-monitor:5.0.0
+    image: w254992/watchtower-telegram-monitor:latest
     container_name: watchtower-notifier
     restart: unless-stopped
     network_mode: host
@@ -47,25 +44,39 @@ services:
         condition: service_started
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./data:/data
-    env_file:
-      - .env
+      - nfs-shared:/data
+    env_file: .env # 加载所有通用配置
     environment:
-      - TZ=Asia/Shanghai
-      # 代理配置（可选，适用于中国大陆用户）
-      # - HTTP_PROXY=http://127.0.0.1:7890
-      # - HTTPS_PROXY=http://127.0.0.1:7890
-      # - NO_PROXY=localhost,127.0.0.1
+      # --- 服务器特定变量 ---
+      # 在每台服务器上单独设置
+      - SERVER_NAME=My_Server_Name
+      # 仅在你的主服务器上设置为 true
+      - PRIMARY_SERVER=false 
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      test: ["CMD", "sh", "-c", "ps aux | grep -v grep | grep -q 'python.*monitor.py'"]
+      test: ["CMD", "sh", "-c", "ps aux | grep -v grep | grep -q 'command_listener'"]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 15s
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
+
+volumes:
+  nfs-shared:
+    driver: local
+    driver_opts:
+      type: nfs
+      # --- NFS 配置 ---
+      # NFS 主服务器 (例如 京东云)
+      # o: addr=127.0.0.1,rw,nfsvers=4
+      # device: ":/srv/watchtower-shared"
+      
+      # NFS 客户端 (例如 云电脑 V2, V4)
+      # 请将 IP 替换为你的NFS服务器IP
+      o: addr=100.81.57.28,rw,nfsvers=4
+      device: ":/srv/watchtower-shared"
