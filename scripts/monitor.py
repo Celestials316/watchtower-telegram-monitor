@@ -1478,121 +1478,105 @@ class WatchtowerMonitor:
 ━━━━━━━━━━━━━━━━━━━━""")
 
 def main():
-    if not SERVER_NAME:
-        logger.error("错误: 必须设置 SERVER_NAME 环境变量")
-        sys.exit(1)
-
-    if not CHAT_ID or not os.getenv('BOT_TOKEN'):
-        logger.error("错误: 必须设置 BOT_TOKEN 和 CHAT_ID 环境变量")
-        sys.exit(1)
-
-    print("=" * 50)
-    print(f"Docker 容器监控通知服务 v{VERSION}")
-    print(f"服务器: {SERVER_NAME}")
-    print(f"主服务器: {PRIMARY_SERVER}")
-    print(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Python 版本: {sys.version.split()[0]}")
-    print("=" * 50)
-    print()
-
-    bot = TelegramBot(os.getenv('BOT_TOKEN'), CHAT_ID, SERVER_NAME)
-    docker = DockerManager()
-    config = ConfigManager(MONITOR_CONFIG, SERVER_NAME)
-    registry = ServerRegistry(SERVER_REGISTRY, SERVER_NAME, PRIMARY_SERVER)
-    coordinator = CommandCoordinator(SERVER_NAME, PRIMARY_SERVER, SERVER_REGISTRY)
-
-    registry.register()
-
-    if not PRIMARY_SERVER:
-        logger.info("从服务器等待 0.5 秒...")
-        time.sleep(0.5)
-
-    handler = CommandHandler(bot, docker, config, registry)
-
-    bot_poller = BotPoller(handler, bot, coordinator)
-    bot_poller.start()
-    logger.info(f"Bot 轮询线程已启动")
-
-    heartbeat = HeartbeatThread(registry)
-    heartbeat.start()
-    logger.info(f"心跳线程已启动")
-
-    all_containers = docker.get_all_containers()
-    monitored = [c for c in all_containers if config.is_monitored(c)]
-    excluded = config.get_excluded_containers()
-
-    logger.info(f"总容器: {len(all_containers)}, 监控: {len(monitored)}, 排除: {len(excluded)}")
-
-    if PRIMARY_SERVER:
-        time.sleep(1)
-        servers = registry.get_active_servers()
-        server_list = "\n".join([
-            f"   • <code>{s}</code>{' 🌟' if registry.is_primary else ''}" 
-            for s in servers
-        ])
-
-        startup_msg = f"""🚀 <b>监控服务启动成功</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📊 <b>服务信息</b>
-   版本: <code>v{VERSION}</code>
-   主服务器: <code>{SERVER_NAME if PRIMARY_SERVER else servers[0] if servers else '未知'}</code> 🌟
-   当前服务器: <code>{SERVER_NAME}</code>
-   语言: <code>Python {sys.version.split()[0]}</code>
-
-🎯 <b>监控状态</b>
-   总容器: <code>{len(all_containers)}</code>
-   监控中: <code>{len(monitored)}</code>
-   已排除: <code>{len(excluded)}</code>
-
-🌐 <b>已连接服务器 ({len(servers)})</b>
-{server_list}
-
-🤖 <b>机器人功能</b>
-   /status - 查看服务器状态
-   /servers - 查看所有服务器概览
-   /update - 更新容器镜像
-   /restart - 重启容器
-   /monitor - 监控管理
-   /help - 显示帮助
-
-💡 <b>新特性 v5.3.2</b>
-   • 修复回调立即响应，避免客户端超时
-   • 修复消息编辑重试机制
-   • 修复服务器协调逻辑
-   • 修复文件锁问题（'a'模式）
-   • 增加心跳超时时间（90->120秒）
-   • 修复多次点击需求问题
-   • 修复消息选项不消失问题
-
-⏰ <b>启动时间</b>
-   <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
-━━━━━━━━━━━━━━━━━━━━
-
-✅ 服务正常运行中"""
-
-        bot.send_message(startup_msg)
-    else:
-        logger.info(f"从服务器已启动，等待主服务器协调")
-
+    """主函数 - 程序入口"""
+    
+    # 信号处理函数
     def signal_handler(signum, frame):
-        logger.info("收到退出信号，正在关闭...")
+        logger.info(f"收到信号 {signum}，准备关闭...")
         shutdown_flag.set()
         sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
+    
+    # 注册信号处理
     signal.signal(signal.SIGTERM, signal_handler)
-
-    monitor = WatchtowerMonitor(bot, docker, config)
+    signal.signal(signal.SIGINT, signal_handler)
+    
     try:
-        monitor.start()
-    except KeyboardInterrupt:
-        logger.info("用户中断")
-    except Exception as e:
-        logger.error(f"监控异常: {e}")
-    finally:
-        shutdown_flag.set()
-        logger.info("服务已停止")
+        # 检查必要的环境变量
+        if not TELEGRAM_API or not CHAT_ID or not SERVER_NAME:
+            logger.error("缺少必要的环境变量: BOT_TOKEN, CHAT_ID, SERVER_NAME")
+            sys.exit(1)
+        
+        logger.info("=" * 50)
+        logger.info(f"🚀 Watchtower Notifier v{VERSION} 启动中...")
+        logger.info(f"🖥️  服务器: {SERVER_NAME}")
+        logger.info(f"{'🌟 ' if PRIMARY_SERVER else '📡 '}角色: {'主服务器' if PRIMARY_SERVER else '从服务器'}")
+        logger.info("=" * 50)
+        
+        # 初始化组件
+        bot = TelegramBot(os.getenv('BOT_TOKEN'), CHAT_ID, SERVER_NAME)
+        docker = DockerManager()
+        config = ConfigManager(MONITOR_CONFIG, SERVER_NAME)
+        registry = ServerRegistry(SERVER_REGISTRY, SERVER_NAME, PRIMARY_SERVER)
+        coordinator = CommandCoordinator(SERVER_NAME, PRIMARY_SERVER, SERVER_REGISTRY)
+        
+        # 注册服务器
+        registry.register()
+        
+        # 初始化命令处理器
+        handler = CommandHandler(bot, docker, config, registry)
+        
+        # 发送启动通知
+        startup_msg = f"""<b>[{SERVER_NAME}]</b> 🚀 <b>系统启动</b>
 
-if __name__ == "__main__":
+━━━━━━━━━━━━━━━━━━━━
+🖥️ <b>服务器信息</b>
+  名称: <code>{SERVER_NAME}</code>
+  角色: <code>{'主服务器 🌟' if PRIMARY_SERVER else '从服务器'}</code>
+  版本: <code>v{VERSION}</code>
+
+⏰ <b>启动时间</b>
+  <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
+━━━━━━━━━━━━━━━━━━━━
+
+✅ 系统已成功启动并开始监控"""
+        
+        bot.send_message(startup_msg)
+        logger.info("✅ 启动通知已发送")
+        
+        # 启动心跳线程
+        heartbeat_thread = HeartbeatThread(registry)
+        heartbeat_thread.start()
+        logger.info("✅ 心跳线程已启动")
+        
+        # 启动 Bot 轮询线程
+        poller = BotPoller(handler, bot, coordinator)
+        poller.start()
+        logger.info("✅ Bot 轮询线程已启动")
+        
+        # 主线程运行 Watchtower 监控
+        monitor = WatchtowerMonitor(bot, docker, config)
+        logger.info("✅ 开始监控 Watchtower 日志")
+        logger.info("=" * 50)
+        
+        monitor.start()
+        
+    except KeyboardInterrupt:
+        logger.info("\n收到中断信号，正在关闭...")
+        shutdown_flag.set()
+    except Exception as e:
+        logger.error(f"程序异常退出: {e}", exc_info=True)
+        sys.exit(1)
+    finally:
+        # 发送关闭通知
+        try:
+            if 'bot' in locals():
+                shutdown_msg = f"""<b>[{SERVER_NAME}]</b> 🛑 <b>系统关闭</b>
+
+━━━━━━━━━━━━━━━━━━━━
+🖥️ <b>服务器</b>: <code>{SERVER_NAME}</code>
+⏰ <b>时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
+━━━━━━━━━━━━━━━━━━━━
+
+⚠️ 监控服务已停止"""
+                bot.send_message(shutdown_msg)
+                logger.info("✅ 关闭通知已发送")
+        except Exception as e:
+            logger.error(f"发送关闭通知失败: {e}")
+        
+        logger.info("=" * 50)
+        logger.info("👋 程序已退出")
+        logger.info("=" * 50)
+
+
+if __name__ == '__main__':
     main()
