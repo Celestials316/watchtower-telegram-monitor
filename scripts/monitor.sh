@@ -1,6 +1,6 @@
 #!/bin/sh
-# Docker 容器监控通知服务 v4.0.0
-# 监控 Watchtower 日志并发送 Telegram 通知 + 机器人交互管理
+# Docker 容器监控通知服务 v4.0.1
+# 监控 Watchtower 日志并发送 Telegram 通知 + 机器人交互管理 (多服务器支持)
 
 echo "正在安装依赖..."
 apk add --no-cache curl docker-cli coreutils grep sed tzdata jq >/dev/null 2>&1
@@ -81,7 +81,7 @@ send_telegram() {
 answer_callback() {
     callback_query_id="$1"
     text="$2"
-    
+
     curl -s -X POST "$TELEGRAM_API/answerCallbackQuery" \
         --data-urlencode "callback_query_id=${callback_query_id}" \
         --data-urlencode "text=${text}" \
@@ -93,12 +93,12 @@ edit_message() {
     message_id="$2"
     new_text="$3"
     reply_markup="$4"
-    
+
     if [ -n "$reply_markup" ]; then
         curl -s -X POST "$TELEGRAM_API/editMessageText" \
             --data-urlencode "chat_id=${chat_id}" \
             --data-urlencode "message_id=${message_id}" \
-            --data-urlencode "text=${SERVER_TAG}${new_text}" \
+            --data-urlencode "text=${new_text}" \
             --data-urlencode "parse_mode=HTML" \
             --data-urlencode "reply_markup=${reply_markup}" \
             --connect-timeout 10 --max-time 30 >/dev/null 2>&1
@@ -106,7 +106,7 @@ edit_message() {
         curl -s -X POST "$TELEGRAM_API/editMessageText" \
             --data-urlencode "chat_id=${chat_id}" \
             --data-urlencode "message_id=${message_id}" \
-            --data-urlencode "text=${SERVER_TAG}${new_text}" \
+            --data-urlencode "text=${new_text}" \
             --data-urlencode "parse_mode=HTML" \
             --connect-timeout 10 --max-time 30 >/dev/null 2>&1
     fi
@@ -115,6 +115,16 @@ edit_message() {
 get_time() { date '+%Y-%m-%d %H:%M:%S'; }
 get_image_name() { echo "$1" | sed 's/:.*$//'; }
 get_short_id() { echo "$1" | sed 's/sha256://' | head -c 12 || echo "unknown"; }
+
+# ==================== 多服务器管理 ====================
+
+get_all_servers() {
+    jq -r 'keys[]' "$MONITOR_CONFIG" 2>/dev/null || echo "$SERVER_NAME"
+}
+
+get_server_count() {
+    get_all_servers | wc -l
+}
 
 # ==================== 容器管理函数 ====================
 
@@ -126,7 +136,7 @@ is_container_monitored() {
     container="$1"
     excluded=$(jq -r --arg srv "$SERVER_NAME" --arg cnt "$container" \
         '.[$srv].excluded[]? | select(. == $cnt)' "$MONITOR_CONFIG" 2>/dev/null)
-    
+
     if [ -n "$excluded" ]; then
         return 1
     else
@@ -136,7 +146,8 @@ is_container_monitored() {
 
 add_to_excluded() {
     container="$1"
-    jq --arg srv "$SERVER_NAME" --arg cnt "$container" \
+    server="${2:-$SERVER_NAME}"
+    jq --arg srv "$server" --arg cnt "$container" \
         '.[$srv].excluded = ((.[$srv].excluded // []) + [$cnt] | unique)' \
         "$MONITOR_CONFIG" > "${MONITOR_CONFIG}.tmp" && \
         mv "${MONITOR_CONFIG}.tmp" "$MONITOR_CONFIG"
@@ -144,7 +155,8 @@ add_to_excluded() {
 
 remove_from_excluded() {
     container="$1"
-    jq --arg srv "$SERVER_NAME" --arg cnt "$container" \
+    server="${2:-$SERVER_NAME}"
+    jq --arg srv "$server" --arg cnt "$container" \
         '.[$srv].excluded = ((.[$srv].excluded // []) - [$cnt])' \
         "$MONITOR_CONFIG" > "${MONITOR_CONFIG}.tmp" && \
         mv "${MONITOR_CONFIG}.tmp" "$MONITOR_CONFIG"
@@ -159,7 +171,8 @@ get_monitored_containers() {
 }
 
 get_excluded_containers() {
-    jq -r --arg srv "$SERVER_NAME" '.[$srv].excluded[]?' "$MONITOR_CONFIG" 2>/dev/null || true
+    server="${1:-$SERVER_NAME}"
+    jq -r --arg srv "$server" '.[$srv].excluded[]?' "$MONITOR_CONFIG" 2>/dev/null || true
 }
 
 # ==================== 版本管理函数 ====================
@@ -280,12 +293,19 @@ cleanup_old_states() {
 
 handle_status_command() {
     chat_id="$1"
-    
-    monitored=$(get_monitored_containers | wc -l)
-    excluded=$(get_excluded_containers | wc -l)
-    total=$(get_all_containers | wc -l)
-    
-    status_msg="📊 <b>服务器状态</b>
+    specified_server="$2"
+
+    # 如果指定了服务器，只显示该服务器
+    if [ -n "$specified_server" ]; then
+        if [ "$specified_server" != "$SERVER_NAME" ]; then
+            return  # 不是当前服务器，忽略
+        fi
+        
+        monitored=$(get_monitored_containers | wc -l)
+        excluded=$(get_excluded_containers | wc -l)
+        total=$(get_all_containers | wc -l)
+
+        status_msg="📊 <b>服务器状态</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 🖥️ <b>服务器信息</b>
@@ -299,53 +319,94 @@ handle_status_command() {
 
 🔍 <b>监控列表</b>"
 
-    if [ "$monitored" -eq 0 ]; then
-        status_msg="$status_msg
-   <i>暂无监控容器</i>"
-    else
-        for container in $(get_monitored_containers); do
-            status=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo "false")
-            if [ "$status" = "true" ]; then
-                status_icon="✅"
-            else
-                status_icon="❌"
-            fi
-            
-            image_tag=$(docker inspect --format='{{.Config.Image}}' "$container" 2>/dev/null | sed 's/.*://')
+        if [ "$monitored" -eq 0 ]; then
             status_msg="$status_msg
-   $status_icon <code>$container</code> [$image_tag]"
-        done
-    fi
+   <i>暂无监控容器</i>"
+        else
+            for container in $(get_monitored_containers); do
+                status=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo "false")
+                if [ "$status" = "true" ]; then
+                    status_icon="✅"
+                else
+                    status_icon="❌"
+                fi
 
-    if [ "$excluded" -gt 0 ]; then
-        status_msg="$status_msg
+                image_tag=$(docker inspect --format='{{.Config.Image}}' "$container" 2>/dev/null | sed 's/.*://')
+                status_msg="$status_msg
+   $status_icon <code>$container</code> [$image_tag]"
+            done
+        fi
+
+        if [ "$excluded" -gt 0 ]; then
+            status_msg="$status_msg
 
 🚫 <b>排除列表</b>"
-        for container in $(get_excluded_containers); do
-            status_msg="$status_msg
+            for container in $(get_excluded_containers); do
+                status_msg="$status_msg
    • <code>$container</code>"
-        done
-    fi
+            done
+        fi
 
-    status_msg="$status_msg
+        status_msg="$status_msg
 ━━━━━━━━━━━━━━━━━━━━"
 
-    send_telegram "$status_msg"
+        send_telegram "$status_msg"
+        return
+    fi
+
+    # 没有指定服务器，显示所有服务器概览
+    server_count=$(get_server_count)
+    
+    if [ "$server_count" -eq 1 ]; then
+        # 单服务器直接显示详情
+        handle_status_command "$chat_id" "$SERVER_NAME"
+    else
+        # 多服务器显示选择按钮
+        buttons='{"inline_keyboard":['
+        first=true
+        for server in $(get_all_servers); do
+            if [ "$first" = true ]; then
+                first=false
+            else
+                buttons="$buttons,"
+            fi
+            buttons="$buttons[{\"text\":\"🖥️ $server\",\"callback_data\":\"status:$server\"}]"
+        done
+        buttons="$buttons"']}'
+
+        send_telegram "请选择要查看的服务器：" "$buttons"
+    fi
 }
 
 handle_update_command() {
     chat_id="$1"
     message_id="$2"
-    container_param="$3"
-    
-    # 如果指定了容器名，直接更新
-    if [ -n "$container_param" ]; then
+    server_param="$3"
+    container_param="$4"
+
+    server_count=$(get_server_count)
+
+    # 情况1: /update container_name (单服务器或当前服务器)
+    if [ -n "$server_param" ] && [ -z "$container_param" ]; then
+        # 检查 server_param 是否是容器名
+        if docker ps -a --format '{{.Names}}' | grep -q "^${server_param}$"; then
+            container_param="$server_param"
+            server_param="$SERVER_NAME"
+        fi
+    fi
+
+    # 情况2: /update server_name container_name
+    if [ -n "$server_param" ] && [ -n "$container_param" ]; then
+        if [ "$server_param" != "$SERVER_NAME" ]; then
+            return  # 不是当前服务器，忽略
+        fi
+
         # 验证容器是否存在
         if ! docker ps -a --format '{{.Names}}' | grep -q "^${container_param}$"; then
             send_telegram "❌ 容器 <code>$container_param</code> 不存在"
             return
         fi
-        
+
         # 直接执行更新确认流程
         confirm_msg="⚠️ <b>确认更新</b>
 
@@ -359,55 +420,89 @@ handle_update_command() {
 
 是否继续？
 ━━━━━━━━━━━━━━━━━━━━"
-        
+
         buttons='{"inline_keyboard":['
-        buttons="$buttons"'[{"text":"✅ 确认更新","callback_data":"confirm_update:'"$container_param"'"}],'
+        buttons="$buttons"'[{"text":"✅ 确认更新","callback_data":"confirm_update:'"$SERVER_NAME"':'"$container_param"'"}],'
         buttons="$buttons"'[{"text":"❌ 取消","callback_data":"cancel"}]'
         buttons="$buttons"']}'
-        
+
         send_telegram "$confirm_msg" "$buttons"
         return
     fi
-    
-    # 没有指定容器，显示选择列表
-    containers=$(get_monitored_containers)
-    
-    if [ -z "$containers" ]; then
-        send_telegram "⚠️ 当前没有可更新的容器"
-        return
-    fi
-    
-    buttons='{"inline_keyboard":['
-    first=true
-    for container in $containers; do
-        if [ "$first" = true ]; then
-            first=false
-        else
-            buttons="$buttons,"
+
+    # 情况3: /update (显示服务器选择)
+    if [ "$server_count" -eq 1 ]; then
+        # 单服务器直接显示容器列表
+        containers=$(get_monitored_containers)
+
+        if [ -z "$containers" ]; then
+            send_telegram "⚠️ 当前没有可更新的容器"
+            return
         fi
-        buttons="$buttons[{\"text\":\"📦 $container\",\"callback_data\":\"update:$container\"}]"
-    done
-    buttons="$buttons"']}'
-    
-    send_telegram "请选择要更新的容器：" "$buttons"
+
+        buttons='{"inline_keyboard":['
+        first=true
+        for container in $containers; do
+            if [ "$first" = true ]; then
+                first=false
+            else
+                buttons="$buttons,"
+            fi
+            buttons="$buttons[{\"text\":\"📦 $container\",\"callback_data\":\"update:$SERVER_NAME:$container\"}]"
+        done
+        buttons="$buttons"']}'
+
+        send_telegram "请选择要更新的容器：" "$buttons"
+    else
+        # 多服务器显示服务器选择
+        buttons='{"inline_keyboard":['
+        first=true
+        for server in $(get_all_servers); do
+            if [ "$first" = true ]; then
+                first=false
+            else
+                buttons="$buttons,"
+            fi
+            buttons="$buttons[{\"text\":\"🖥️ $server\",\"callback_data\":\"update_server:$server\"}]"
+        done
+        buttons="$buttons"']}'
+
+        send_telegram "请选择要操作的服务器：" "$buttons"
+    fi
 }
 
 handle_restart_command() {
     chat_id="$1"
     message_id="$2"
-    container_param="$3"
-    
-    # 如果指定了容器名，直接重启
-    if [ -n "$container_param" ]; then
+    server_param="$3"
+    container_param="$4"
+
+    server_count=$(get_server_count)
+
+    # 情况1: /restart container_name (单服务器或当前服务器)
+    if [ -n "$server_param" ] && [ -z "$container_param" ]; then
+        # 检查 server_param 是否是容器名
+        if docker ps -a --format '{{.Names}}' | grep -q "^${server_param}$"; then
+            container_param="$server_param"
+            server_param="$SERVER_NAME"
+        fi
+    fi
+
+    # 情况2: /restart server_name container_name
+    if [ -n "$server_param" ] && [ -n "$container_param" ]; then
+        if [ "$server_param" != "$SERVER_NAME" ]; then
+            return  # 不是当前服务器，忽略
+        fi
+
         # 验证容器是否存在
         if ! docker ps -a --format '{{.Names}}' | grep -q "^${container_param}$"; then
             send_telegram "❌ 容器 <code>$container_param</code> 不存在"
             return
         fi
-        
+
         # 直接执行重启
         send_telegram "⏳ 正在重启容器 <code>$container_param</code>..."
-        
+
         if docker restart "$container_param" >/dev/null 2>&1; then
             result_msg="✅ <b>重启成功</b>
 
@@ -424,44 +519,94 @@ handle_restart_command() {
 请检查容器状态
 ━━━━━━━━━━━━━━━━━━━━"
         fi
-        
+
         send_telegram "$result_msg"
         return
     fi
-    
-    # 没有指定容器，显示选择列表
-    containers=$(get_all_containers)
-    
-    if [ -z "$containers" ]; then
-        send_telegram "⚠️ 当前没有可重启的容器"
-        return
-    fi
-    
-    buttons='{"inline_keyboard":['
-    first=true
-    for container in $containers; do
-        if [ "$first" = true ]; then
-            first=false
-        else
-            buttons="$buttons,"
+
+    # 情况3: /restart (显示服务器选择)
+    if [ "$server_count" -eq 1 ]; then
+        # 单服务器直接显示容器列表
+        containers=$(get_all_containers)
+
+        if [ -z "$containers" ]; then
+            send_telegram "⚠️ 当前没有可重启的容器"
+            return
         fi
-        buttons="$buttons[{\"text\":\"🔄 $container\",\"callback_data\":\"restart:$container\"}]"
-    done
-    buttons="$buttons"']}'
-    
-    send_telegram "请选择要重启的容器：" "$buttons"
+
+        buttons='{"inline_keyboard":['
+        first=true
+        for container in $containers; do
+            if [ "$first" = true ]; then
+                first=false
+            else
+                buttons="$buttons,"
+            fi
+            buttons="$buttons[{\"text\":\"🔄 $container\",\"callback_data\":\"restart:$SERVER_NAME:$container\"}]"
+        done
+        buttons="$buttons"']}'
+
+        send_telegram "请选择要重启的容器：" "$buttons"
+    else
+        # 多服务器显示服务器选择
+        buttons='{"inline_keyboard":['
+        first=true
+        for server in $(get_all_servers); do
+            if [ "$first" = true ]; then
+                first=false
+            else
+                buttons="$buttons,"
+            fi
+            buttons="$buttons[{\"text\":\"🖥️ $server\",\"callback_data\":\"restart_server:$server\"}]"
+        done
+        buttons="$buttons"']}'
+
+        send_telegram "请选择要操作的服务器：" "$buttons"
+    fi
 }
 
 handle_monitor_command() {
     chat_id="$1"
-    
-    buttons='{"inline_keyboard":['
-    buttons="$buttons"'[{"text":"➕ 添加监控","callback_data":"monitor:add"}],'
-    buttons="$buttons"'[{"text":"➖ 移除监控","callback_data":"monitor:remove"}],'
-    buttons="$buttons"'[{"text":"📋 查看列表","callback_data":"monitor:list"}]'
-    buttons="$buttons"']}'
-    
-    send_telegram "📡 <b>监控管理</b>\n\n请选择操作：" "$buttons"
+    server_param="$2"
+
+    server_count=$(get_server_count)
+
+    # 如果指定了服务器
+    if [ -n "$server_param" ]; then
+        if [ "$server_param" != "$SERVER_NAME" ]; then
+            return  # 不是当前服务器，忽略
+        fi
+
+        buttons='{"inline_keyboard":['
+        buttons="$buttons"'[{"text":"➕ 添加监控","callback_data":"monitor:add:'"$SERVER_NAME"'"}],'
+        buttons="$buttons"'[{"text":"➖ 移除监控","callback_data":"monitor:remove:'"$SERVER_NAME"'"}],'
+        buttons="$buttons"'[{"text":"📋 查看列表","callback_data":"status:'"$SERVER_NAME"'"}]'
+        buttons="$buttons"']}'
+
+        send_telegram "📡 <b>监控管理 - ${SERVER_NAME}</b>\n\n请选择操作：" "$buttons"
+        return
+    fi
+
+    # 没有指定服务器
+    if [ "$server_count" -eq 1 ]; then
+        # 单服务器直接显示操作选项
+        handle_monitor_command "$chat_id" "$SERVER_NAME"
+    else
+        # 多服务器显示服务器选择
+        buttons='{"inline_keyboard":['
+        first=true
+        for server in $(get_all_servers); do
+            if [ "$first" = true ]; then
+                first=false
+            else
+                buttons="$buttons,"
+            fi
+            buttons="$buttons[{\"text\":\"🖥️ $server\",\"callback_data\":\"monitor_server:$server\"}]"
+        done
+        buttons="$buttons"']}'
+
+        send_telegram "请选择要管理的服务器：" "$buttons"
+    fi
 }
 
 handle_help_command() {
@@ -470,16 +615,16 @@ handle_help_command() {
 ━━━━━━━━━━━━━━━━━━━━
 <b>可用命令：</b>
 
-/status
+/status [服务器名]
   查看服务器状态和容器列表
 
-/update [容器名]
-  更新容器镜像（不指定则显示选择列表）
+/update [服务器名] [容器名]
+  更新容器镜像
 
-/restart [容器名]
-  重启容器（不指定则显示选择列表）
+/restart [服务器名] [容器名]
+  重启容器
 
-/monitor
+/monitor [服务器名]
   监控管理（添加/移除监控容器）
 
 /help
@@ -487,12 +632,19 @@ handle_help_command() {
 ━━━━━━━━━━━━━━━━━━━━
 
 💡 <b>使用提示：</b>
-• 命令可以带容器名直接操作，或不带容器名选择
-  例如: /restart 或 /restart nginx
+• 单服务器环境：
+  /restart nginx
+  /update nginx
 
-• 多服务器环境下，每条消息都会标注服务器名称
+• 多服务器环境：
+  /restart server1 nginx
+  /update server1 nginx
+  
+• 不带参数则显示选择菜单：
+  /restart  (显示服务器选择)
+  /update   (显示服务器选择)
 
-• 所有危险操作都需要二次确认，避免误操作
+• 所有危险操作都需要二次确认
 
 • 排除监控的容器不会收到自动更新通知
 ━━━━━━━━━━━━━━━━━━━━"
@@ -507,18 +659,62 @@ handle_callback() {
     callback_query_id="$2"
     chat_id="$3"
     message_id="$4"
-    
+
     action=$(echo "$callback_data" | cut -d: -f1)
-    param=$(echo "$callback_data" | cut -d: -f2-)
-    
+    param1=$(echo "$callback_data" | cut -d: -f2)
+    param2=$(echo "$callback_data" | cut -d: -f3)
+
     case "$action" in
+        status)
+            # param1 是服务器名
+            if [ "$param1" = "$SERVER_NAME" ]; then
+                answer_callback "$callback_query_id" "正在获取状态..."
+                handle_status_command "$chat_id" "$param1"
+            fi
+            ;;
+
+        update_server)
+            # param1 是服务器名，显示该服务器的容器列表
+            if [ "$param1" != "$SERVER_NAME" ]; then
+                return
+            fi
+
+            answer_callback "$callback_query_id" "正在加载容器列表..."
+
+            containers=$(get_monitored_containers)
+            if [ -z "$containers" ]; then
+                edit_message "$chat_id" "$message_id" "⚠️ 服务器 <code>$param1</code> 没有可更新的容器"
+                return
+            fi
+
+            buttons='{"inline_keyboard":['
+            first=true
+            for container in $containers; do
+                if [ "$first" = true ]; then
+                    first=false
+                else
+                    buttons="$buttons,"
+                fi
+                buttons="$buttons[{\"text\":\"📦 $container\",\"callback_data\":\"update:$param1:$container\"}]"
+            done
+            buttons="$buttons"']}'
+
+            edit_message "$chat_id" "$message_id" "服务器: <code>$param1</code>\n\n请选择要更新的容器：" "$buttons"
+            ;;
+
         update)
+            # param1 是服务器名，param2 是容器名
+            if [ "$param1" != "$SERVER_NAME" ]; then
+                return
+            fi
+
             answer_callback "$callback_query_id" "正在准备更新..."
-            
+
             confirm_msg="⚠️ <b>确认更新</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-📦 容器: <code>$param</code>
+🖥️ 服务器: <code>$param1</code>
+📦 容器: <code>$param2</code>
 
 ⚠️ 此操作将：
    1. 拉取最新镜像
@@ -527,95 +723,162 @@ handle_callback() {
 
 是否继续？
 ━━━━━━━━━━━━━━━━━━━━"
-            
+
             buttons='{"inline_keyboard":['
-            buttons="${buttons}[{\"text\":\"✅ 确认更新\",\"callback_data\":\"confirm_update:${param}\"}],"
+            buttons="${buttons}[{\"text\":\"✅ 确认更新\",\"callback_data\":\"confirm_update:${param1}:${param2}\"}],"
             buttons="${buttons}[{\"text\":\"❌ 取消\",\"callback_data\":\"cancel\"}]"
             buttons="${buttons}]}"
-            
+
             edit_message "$chat_id" "$message_id" "$confirm_msg" "$buttons"
             ;;
-            
+
         confirm_update)
+            if [ "$param1" != "$SERVER_NAME" ]; then
+                return
+            fi
+
             answer_callback "$callback_query_id" "开始更新容器..."
-            edit_message "$chat_id" "$message_id" "⏳ 正在更新容器 <code>$param</code>，请稍候..."
-            
+            edit_message "$chat_id" "$message_id" "⏳ 正在更新容器 <code>$param2</code>，请稍候..."
+
             # 执行更新
             (
                 sleep 2
-                old_id=$(docker inspect --format='{{.Image}}' "$param" 2>/dev/null)
-                docker pull $(docker inspect --format='{{.Config.Image}}' "$param" 2>/dev/null) >/dev/null 2>&1
-                docker stop "$param" >/dev/null 2>&1
-                docker rm "$param" >/dev/null 2>&1
-                
-                # 这里需要用户提供完整的 docker run 命令，暂时只能给出提示
+                old_id=$(docker inspect --format='{{.Image}}' "$param2" 2>/dev/null)
+                docker pull $(docker inspect --format='{{.Config.Image}}' "$param2" 2>/dev/null) >/dev/null 2>&1
+                docker stop "$param2" >/dev/null 2>&1
+                docker rm "$param2" >/dev/null 2>&1
+
                 result_msg="✅ <b>更新完成</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-📦 容器: <code>$param</code>
+🖥️ 服务器: <code>$param1</code>
+📦 容器: <code>$param2</code>
 
 ⚠️ 注意：
 容器已停止，请使用原启动命令重新创建容器
 
 💡 建议使用 docker-compose 或保存启动脚本
 ━━━━━━━━━━━━━━━━━━━━"
-                
+
                 edit_message "$chat_id" "$message_id" "$result_msg"
             ) &
             ;;
-            
+
+        restart_server)
+            # param1 是服务器名，显示该服务器的容器列表
+            if [ "$param1" != "$SERVER_NAME" ]; then
+                return
+            fi
+
+            answer_callback "$callback_query_id" "正在加载容器列表..."
+
+            containers=$(get_all_containers)
+            if [ -z "$containers" ]; then
+                edit_message "$chat_id" "$message_id" "⚠️ 服务器 <code>$param1</code> 没有可重启的容器"
+                return
+            fi
+
+            buttons='{"inline_keyboard":['
+            first=true
+            for container in $containers; do
+                if [ "$first" = true ]; then
+                    first=false
+                else
+                    buttons="$buttons,"
+                fi
+                buttons="$buttons[{\"text\":\"🔄 $container\",\"callback_data\":\"restart:$param1:$container\"}]"
+            done
+            buttons="$buttons"']}'
+
+            edit_message "$chat_id" "$message_id" "服务器: <code>$param1</code>\n\n请选择要重启的容器：" "$buttons"
+            ;;
+
         restart)
+            # param1 是服务器名，param2 是容器名
+            if [ "$param1" != "$SERVER_NAME" ]; then
+                return
+            fi
+
             answer_callback "$callback_query_id" "正在准备重启..."
-            
+
             confirm_msg="⚠️ <b>确认重启</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-📦 容器: <code>$param</code>
+🖥️ 服务器: <code>$param1</code>
+📦 容器: <code>$param2</code>
 
 是否继续？
 ━━━━━━━━━━━━━━━━━━━━"
-            
+
             buttons='{"inline_keyboard":['
-            buttons="${buttons}[{\"text\":\"✅ 确认重启\",\"callback_data\":\"confirm_restart:${param}\"}],"
+            buttons="${buttons}[{\"text\":\"✅ 确认重启\",\"callback_data\":\"confirm_restart:${param1}:${param2}\"}],"
             buttons="${buttons}[{\"text\":\"❌ 取消\",\"callback_data\":\"cancel\"}]"
             buttons="${buttons}]}"
-            
+
             edit_message "$chat_id" "$message_id" "$confirm_msg" "$buttons"
             ;;
-            
+
         confirm_restart)
+            if [ "$param1" != "$SERVER_NAME" ]; then
+                return
+            fi
+
             answer_callback "$callback_query_id" "开始重启容器..."
-            edit_message "$chat_id" "$message_id" "⏳ 正在重启容器 <code>$param</code>..."
-            
-            if docker restart "$param" >/dev/null 2>&1; then
+            edit_message "$chat_id" "$message_id" "⏳ 正在重启容器 <code>$param2</code>..."
+
+            if docker restart "$param2" >/dev/null 2>&1; then
                 result_msg="✅ <b>重启成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-📦 容器: <code>$param</code>
+🖥️ 服务器: <code>$param1</code>
+📦 容器: <code>$param2</code>
 ⏰ 时间: <code>$(get_time)</code>
 ━━━━━━━━━━━━━━━━━━━━"
             else
                 result_msg="❌ <b>重启失败</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-📦 容器: <code>$param</code>
+🖥️ 服务器: <code>$param1</code>
+📦 容器: <code>$param2</code>
 
 请检查容器状态
 ━━━━━━━━━━━━━━━━━━━━"
             fi
-            
+
             edit_message "$chat_id" "$message_id" "$result_msg"
             ;;
-            
-        monitor:add)
-            answer_callback "$callback_query_id" "选择要添加监控的容器"
-            
-            excluded=$(get_excluded_containers)
-            if [ -z "$excluded" ]; then
-                edit_message "$chat_id" "$message_id" "✅ 所有容器都已在监控中"
+
+        monitor_server)
+            # param1 是服务器名
+            if [ "$param1" != "$SERVER_NAME" ]; then
                 return
             fi
-            
+
+            answer_callback "$callback_query_id" "正在加载监控选项..."
+
+            buttons='{"inline_keyboard":['
+            buttons="$buttons"'[{"text":"➕ 添加监控","callback_data":"monitor:add:'"$param1"'"}],'
+            buttons="$buttons"'[{"text":"➖ 移除监控","callback_data":"monitor:remove:'"$param1"'"}],'
+            buttons="$buttons"'[{"text":"📋 查看列表","callback_data":"status:'"$param1"'"}]'
+            buttons="$buttons"']}'
+
+            edit_message "$chat_id" "$message_id" "📡 <b>监控管理 - $param1</b>\n\n请选择操作：" "$buttons"
+            ;;
+
+        "monitor:add")
+            # param1 是服务器名
+            if [ "$param1" != "$SERVER_NAME" ]; then
+                return
+            fi
+
+            answer_callback "$callback_query_id" "选择要添加监控的容器"
+
+            excluded=$(get_excluded_containers "$param1")
+            if [ -z "$excluded" ]; then
+                edit_message "$chat_id" "$message_id" "✅ 服务器 <code>$param1</code> 的所有容器都已在监控中"
+                return
+            fi
+
             buttons='{"inline_keyboard":['
             first=true
             for container in $excluded; do
@@ -624,28 +887,38 @@ handle_callback() {
                 else
                     buttons="$buttons,"
                 fi
-                buttons="$buttons[{\"text\":\"➕ $container\",\"callback_data\":\"add_monitor:$container\"}]"
+                buttons="$buttons[{\"text\":\"➕ $container\",\"callback_data\":\"add_monitor:$param1:$container\"}]"
             done
             buttons="$buttons"']}'
-            
-            edit_message "$chat_id" "$message_id" "请选择要添加监控的容器：" "$buttons"
+
+            edit_message "$chat_id" "$message_id" "服务器: <code>$param1</code>\n\n请选择要添加监控的容器：" "$buttons"
             ;;
-            
+
         add_monitor)
-            remove_from_excluded "$param"
-            answer_callback "$callback_query_id" "已添加到监控列表"
-            edit_message "$chat_id" "$message_id" "✅ 已将 <code>$param</code> 添加到监控列表"
-            ;;
-            
-        monitor:remove)
-            answer_callback "$callback_query_id" "选择要移除监控的容器"
-            
-            monitored=$(get_monitored_containers)
-            if [ -z "$monitored" ]; then
-                edit_message "$chat_id" "$message_id" "⚠️ 当前没有监控中的容器"
+            # param1 是服务器名，param2 是容器名
+            if [ "$param1" != "$SERVER_NAME" ]; then
                 return
             fi
-            
+
+            remove_from_excluded "$param2" "$param1"
+            answer_callback "$callback_query_id" "已添加到监控列表"
+            edit_message "$chat_id" "$message_id" "✅ 已将 <code>$param2</code> 添加到 <code>$param1</code> 的监控列表"
+            ;;
+
+        "monitor:remove")
+            # param1 是服务器名
+            if [ "$param1" != "$SERVER_NAME" ]; then
+                return
+            fi
+
+            answer_callback "$callback_query_id" "选择要移除监控的容器"
+
+            monitored=$(get_monitored_containers)
+            if [ -z "$monitored" ]; then
+                edit_message "$chat_id" "$message_id" "⚠️ 服务器 <code>$param1</code> 当前没有监控中的容器"
+                return
+            fi
+
             buttons='{"inline_keyboard":['
             first=true
             for container in $monitored; do
@@ -654,24 +927,24 @@ handle_callback() {
                 else
                     buttons="$buttons,"
                 fi
-                buttons="$buttons[{\"text\":\"➖ $container\",\"callback_data\":\"remove_monitor:$container\"}]"
+                buttons="$buttons[{\"text\":\"➖ $container\",\"callback_data\":\"remove_monitor:$param1:$container\"}]"
             done
             buttons="$buttons"']}'
-            
-            edit_message "$chat_id" "$message_id" "请选择要移除监控的容器：" "$buttons"
+
+            edit_message "$chat_id" "$message_id" "服务器: <code>$param1</code>\n\n请选择要移除监控的容器：" "$buttons"
             ;;
-            
+
         remove_monitor)
-            add_to_excluded "$param"
+            # param1 是服务器名，param2 是容器名
+            if [ "$param1" != "$SERVER_NAME" ]; then
+                return
+            fi
+
+            add_to_excluded "$param2" "$param1"
             answer_callback "$callback_query_id" "已从监控列表移除"
-            edit_message "$chat_id" "$message_id" "✅ 已将 <code>$param</code> 从监控列表移除"
+            edit_message "$chat_id" "$message_id" "✅ 已将 <code>$param2</code> 从 <code>$param1</code> 的监控列表移除"
             ;;
-            
-        monitor:list)
-            handle_status_command "$chat_id"
-            answer_callback "$callback_query_id" "已刷新状态"
-            ;;
-            
+
         cancel)
             answer_callback "$callback_query_id" "已取消操作"
             edit_message "$chat_id" "$message_id" "❌ 操作已取消"
@@ -683,58 +956,64 @@ handle_callback() {
 
 bot_handler() {
     last_update_id=0
-    
+
     while true; do
         updates=$(curl -s -X POST "$TELEGRAM_API/getUpdates" \
             --data-urlencode "offset=$((last_update_id + 1))" \
             --data-urlencode "timeout=30" \
             --connect-timeout 35 --max-time 40 2>/dev/null)
-        
+
         if [ -z "$updates" ] || ! echo "$updates" | grep -q '"ok":true'; then
             sleep 5
             continue
         fi
-        
+
         result_count=$(echo "$updates" | jq '.result | length' 2>/dev/null || echo "0")
-        
+
         if [ "$result_count" -eq 0 ]; then
             continue
         fi
-        
+
         i=0
         while [ $i -lt "$result_count" ]; do
             update=$(echo "$updates" | jq ".result[$i]" 2>/dev/null)
             update_id=$(echo "$update" | jq -r '.update_id' 2>/dev/null)
-            
+
             if [ -n "$update_id" ] && [ "$update_id" != "null" ]; then
                 last_update_id=$update_id
             fi
-            
+
             # 处理命令消息
             message=$(echo "$update" | jq -r '.message.text' 2>/dev/null)
             chat_id=$(echo "$update" | jq -r '.message.chat.id' 2>/dev/null)
             message_id=$(echo "$update" | jq -r '.message.message_id' 2>/dev/null)
-            
+
             if [ -n "$message" ] && [ "$message" != "null" ] && [ "$chat_id" = "$CHAT_ID" ]; then
                 # 提取命令和参数
                 cmd=$(echo "$message" | awk '{print $1}')
-                param=""
-                
-                # 检查是否有参数（命令后有空格和内容）
+                param1=""
+                param2=""
+
+                # 检查是否有参数
                 if echo "$message" | grep -q " "; then
-                    param=$(echo "$message" | sed 's/^[^ ]* *//')
+                    # 提取第一个参数
+                    param1=$(echo "$message" | awk '{print $2}')
+                    # 提取第二个参数（如果存在）
+                    if echo "$message" | awk '{print $3}' | grep -q "."; then
+                        param2=$(echo "$message" | awk '{print $3}')
+                    fi
                 fi
-                
+
                 case "$cmd" in
-                    /status) handle_status_command "$chat_id" ;;
-                    /update) handle_update_command "$chat_id" "$message_id" "$param" ;;
-                    /restart) handle_restart_command "$chat_id" "$message_id" "$param" ;;
-                    /monitor) handle_monitor_command "$chat_id" ;;
+                    /status) handle_status_command "$chat_id" "$param1" ;;
+                    /update) handle_update_command "$chat_id" "$message_id" "$param1" "$param2" ;;
+                    /restart) handle_restart_command "$chat_id" "$message_id" "$param1" "$param2" ;;
+                    /monitor) handle_monitor_command "$chat_id" "$param1" ;;
                     /help) handle_help_command ;;
                     /start) handle_help_command ;;
                 esac
             fi
-            
+
             # 处理回调
             callback_query=$(echo "$update" | jq -r '.callback_query' 2>/dev/null)
             if [ -n "$callback_query" ] && [ "$callback_query" != "null" ]; then
@@ -742,15 +1021,15 @@ bot_handler() {
                 callback_query_id=$(echo "$callback_query" | jq -r '.id' 2>/dev/null)
                 callback_chat_id=$(echo "$callback_query" | jq -r '.message.chat.id' 2>/dev/null)
                 callback_message_id=$(echo "$callback_query" | jq -r '.message.message_id' 2>/dev/null)
-                
+
                 if [ "$callback_chat_id" = "$CHAT_ID" ]; then
                     handle_callback "$callback_data" "$callback_query_id" "$callback_chat_id" "$callback_message_id"
                 fi
             fi
-            
+
             i=$((i + 1))
         done
-        
+
         sleep 1
     done
 }
@@ -758,7 +1037,7 @@ bot_handler() {
 # ==================== 主程序 ====================
 
 echo "=========================================="
-echo "Docker 容器监控通知服务 v4.0.0"
+echo "Docker 容器监控通知服务 v4.0.1"
 echo "服务器: ${SERVER_NAME}"
 echo "启动时间: $(get_time)"
 echo "机器人: 已启用"
@@ -843,7 +1122,7 @@ startup_message="🚀 <b>监控服务启动成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📊 <b>服务信息</b>
-   版本: <code>v4.0.0</code>
+   版本: <code>v4.0.1</code>
    服务器: <code>${SERVER_NAME}</code>
 
 🎯 <b>监控状态</b>
@@ -854,10 +1133,10 @@ startup_message="🚀 <b>监控服务启动成功</b>
 ${monitor_list}
 
 🤖 <b>机器人功能</b>
-   /status - 查看状态
-   /update [容器名] - 更新容器
-   /restart [容器名] - 重启容器
-   /monitor - 监控管理
+   /status [服务器] - 查看状态
+   /update [服务器] [容器] - 更新
+   /restart [服务器] [容器] - 重启
+   /monitor [服务器] - 监控管理
    /help - 显示帮助
 
 ⏰ <b>启动时间</b>
@@ -895,7 +1174,7 @@ docker logs -f --tail 0 watchtower 2>&1 | while IFS= read -r line; do
                 echo "[$(date '+%H:%M:%S')] → $container_name 已被排除，跳过通知"
                 continue
             fi
-            
+
             echo "[$(date '+%H:%M:%S')] → 捕获到停止: $container_name"
 
             old_state=$(get_container_state "$container_name")
@@ -984,8 +1263,8 @@ docker logs -f --tail 0 watchtower 2>&1 | while IFS= read -r line; do
                 img_name=$(echo "$new_tag_full" | sed 's/:.*$//')
                 time=$(date '+%Y-%m-%d %H:%M:%S')
 
-                old_tag=$(echo "$old_tag_full" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
-                new_tag=$(echo "$new_tag_full" | grep -oE ':[^:]+$' | sed 's/://' || echo "latest")
+                old_tag=$(echo "$old_tag_full" | grep -oE ':[^:]+ | sed 's/://' || echo "latest")
+                new_tag=$(echo "$new_tag_full" | grep -oE ':[^:]+ | sed 's/://' || echo "latest")
                 old_id_short=$(echo "$old_id_full" | sed 's/sha256://' | head -c 12)
                 new_id_short=$(echo "$new_id_full" | sed 's/sha256://' | head -c 12)
 
