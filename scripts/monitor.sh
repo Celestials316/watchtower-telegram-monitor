@@ -1,5 +1,5 @@
 #!/bin/sh
-# Docker 容器监控通知服务 v4.0.0
+# Docker 容器监控通知服务 v4.0.1
 # 监控 Watchtower 日志并发送 Telegram 通知 + 机器人交互管理
 
 echo "正在安装依赖..."
@@ -276,335 +276,6 @@ cleanup_old_states() {
     fi
 }
 
-# ==================== 机器人命令处理 ====================
-
-handle_status_command() {
-    chat_id="$1"
-    
-    monitored=$(get_monitored_containers | wc -l)
-    excluded=$(get_excluded_containers | wc -l)
-    total=$(get_all_containers | wc -l)
-    
-    status_msg="📊 <b>服务器状态</b>
-
-━━━━━━━━━━━━━━━━━━━━
-🖥️ <b>服务器信息</b>
-   名称: <code>${SERVER_NAME}</code>
-   时间: <code>$(get_time)</code>
-
-📦 <b>容器统计</b>
-   总计: <code>${total}</code>
-   监控中: <code>${monitored}</code>
-   已排除: <code>${excluded}</code>
-
-🔍 <b>监控列表</b>"
-
-    if [ "$monitored" -eq 0 ]; then
-        status_msg="$status_msg
-   <i>暂无监控容器</i>"
-    else
-        for container in $(get_monitored_containers); do
-            status=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo "false")
-            if [ "$status" = "true" ]; then
-                status_icon="✅"
-            else
-                status_icon="❌"
-            fi
-            
-            image_tag=$(docker inspect --format='{{.Config.Image}}' "$container" 2>/dev/null | sed 's/.*://')
-            status_msg="$status_msg
-   $status_icon <code>$container</code> [$image_tag]"
-        done
-    fi
-
-    if [ "$excluded" -gt 0 ]; then
-        status_msg="$status_msg
-
-🚫 <b>排除列表</b>"
-        for container in $(get_excluded_containers); do
-            status_msg="$status_msg
-   • <code>$container</code>"
-        done
-    fi
-
-    status_msg="$status_msg
-━━━━━━━━━━━━━━━━━━━━"
-
-    send_telegram "$status_msg"
-}
-
-handle_update_command() {
-    chat_id="$1"
-    message_id="$2"
-    
-    containers=$(get_monitored_containers)
-    
-    if [ -z "$containers" ]; then
-        send_telegram "⚠️ 当前没有可更新的容器"
-        return
-    fi
-    
-    buttons='{"inline_keyboard":['
-    first=true
-    for container in $containers; do
-        if [ "$first" = true ]; then
-            first=false
-        else
-            buttons="$buttons,"
-        fi
-        buttons="$buttons[{\"text\":\"📦 $container\",\"callback_data\":\"update:$container\"}]"
-    done
-    buttons="$buttons"']}'
-    
-    send_telegram "请选择要更新的容器：" "$buttons"
-}
-
-handle_restart_command() {
-    chat_id="$1"
-    message_id="$2"
-    
-    containers=$(get_all_containers)
-    
-    if [ -z "$containers" ]; then
-        send_telegram "⚠️ 当前没有可重启的容器"
-        return
-    fi
-    
-    buttons='{"inline_keyboard":['
-    first=true
-    for container in $containers; do
-        if [ "$first" = true ]; then
-            first=false
-        else
-            buttons="$buttons,"
-        fi
-        buttons="$buttons[{\"text\":\"🔄 $container\",\"callback_data\":\"restart:$container\"}]"
-    done
-    buttons="$buttons"']}'
-    
-    send_telegram "请选择要重启的容器：" "$buttons"
-}
-
-handle_monitor_command() {
-    chat_id="$1"
-    
-    buttons='{"inline_keyboard":['
-    buttons="$buttons"'[{"text":"➕ 添加监控","callback_data":"monitor:add"}],'
-    buttons="$buttons"'[{"text":"➖ 移除监控","callback_data":"monitor:remove"}],'
-    buttons="$buttons"'[{"text":"📋 查看列表","callback_data":"monitor:list"}]'
-    buttons="$buttons"']}'
-    
-    send_telegram "📡 <b>监控管理</b>\n\n请选择操作：" "$buttons"
-}
-
-handle_help_command() {
-    help_msg="📖 <b>命令帮助</b>
-
-━━━━━━━━━━━━━━━━━━━━
-<b>可用命令：</b>
-
-/status - 查看服务器状态
-   查看容器列表、运行状态和监控配置
-
-/update - 更新容器
-   选择容器进行镜像更新
-
-/restart - 重启容器
-   选择容器进行重启操作
-
-/monitor - 监控管理
-   添加或移除监控的容器
-
-/help - 显示此帮助信息
-━━━━━━━━━━━━━━━━━━━━
-
-💡 <b>提示：</b>
-• 多服务器环境下，每条消息都会标注服务器名称
-• 所有操作都需要二次确认，避免误操作
-• 排除监控的容器不会收到自动更新通知"
-
-    send_telegram "$help_msg"
-}
-
-# ==================== 回调处理 ====================
-
-handle_callback() {
-    callback_data="$1"
-    callback_query_id="$2"
-    chat_id="$3"
-    message_id="$4"
-    
-    action=$(echo "$callback_data" | cut -d: -f1)
-    param=$(echo "$callback_data" | cut -d: -f2-)
-    
-    case "$action" in
-        update)
-            answer_callback "$callback_query_id" "正在准备更新..."
-            
-            confirm_msg="⚠️ <b>确认更新</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 容器: <code>$param</code>
-
-⚠️ 此操作将：
-   1. 拉取最新镜像
-   2. 停止当前容器
-   3. 启动新版本容器
-
-是否继续？
-━━━━━━━━━━━━━━━━━━━━"
-            
-            buttons='{"inline_keyboard":['
-            buttons="$buttons"'[{"text":"✅ 确认更新","callback_data":"confirm_update:'"$param"'"}],'
-            buttons="$buttons"'[{"text":"❌ 取消","callback_data":"cancel"}]'
-            buttons="$buttons"']}'
-            
-            edit_message "$chat_id" "$message_id" "$confirm_msg" "$buttons"
-            ;;
-            
-        confirm_update)
-            answer_callback "$callback_query_id" "开始更新容器..."
-            edit_message "$chat_id" "$message_id" "⏳ 正在更新容器 <code>$param</code>，请稍候..."
-            
-            # 执行更新
-            (
-                sleep 2
-                old_id=$(docker inspect --format='{{.Image}}' "$param" 2>/dev/null)
-                docker pull $(docker inspect --format='{{.Config.Image}}' "$param" 2>/dev/null) >/dev/null 2>&1
-                docker stop "$param" >/dev/null 2>&1
-                docker rm "$param" >/dev/null 2>&1
-                
-                # 这里需要用户提供完整的 docker run 命令，暂时只能给出提示
-                result_msg="✅ <b>更新完成</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 容器: <code>$param</code>
-
-⚠️ 注意：
-容器已停止，请使用原启动命令重新创建容器
-
-💡 建议使用 docker-compose 或保存启动脚本
-━━━━━━━━━━━━━━━━━━━━"
-                
-                edit_message "$chat_id" "$message_id" "$result_msg"
-            ) &
-            ;;
-            
-        restart)
-            answer_callback "$callback_query_id" "正在准备重启..."
-            
-            confirm_msg="⚠️ <b>确认重启</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 容器: <code>$param</code>
-
-是否继续？
-━━━━━━━━━━━━━━━━━━━━"
-            
-            buttons='{"inline_keyboard":['
-            buttons="$buttons"'[{"text":"✅ 确认重启","callback_data":"confirm_restart:'"$param"'"}],'
-            buttons="$buttons"'[{"text":"❌ 取消","callback_data":"cancel"}]'
-            buttons="$buttons"']}'
-            
-            edit_message "$chat_id" "$message_id" "$confirm_msg" "$buttons"
-            ;;
-            
-        confirm_restart)
-            answer_callback "$callback_query_id" "开始重启容器..."
-            edit_message "$chat_id" "$message_id" "⏳ 正在重启容器 <code>$param</code>..."
-            
-            if docker restart "$param" >/dev/null 2>&1; then
-                result_msg="✅ <b>重启成功</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 容器: <code>$param</code>
-⏰ 时间: <code>$(get_time)</code>
-━━━━━━━━━━━━━━━━━━━━"
-            else
-                result_msg="❌ <b>重启失败</b>
-
-━━━━━━━━━━━━━━━━━━━━
-📦 容器: <code>$param</code>
-
-请检查容器状态
-━━━━━━━━━━━━━━━━━━━━"
-            fi
-            
-            edit_message "$chat_id" "$message_id" "$result_msg"
-            ;;
-            
-        monitor:add)
-            answer_callback "$callback_query_id" "选择要添加监控的容器"
-            
-            excluded=$(get_excluded_containers)
-            if [ -z "$excluded" ]; then
-                edit_message "$chat_id" "$message_id" "✅ 所有容器都已在监控中"
-                return
-            fi
-            
-            buttons='{"inline_keyboard":['
-            first=true
-            for container in $excluded; do
-                if [ "$first" = true ]; then
-                    first=false
-                else
-                    buttons="$buttons,"
-                fi
-                buttons="$buttons[{\"text\":\"➕ $container\",\"callback_data\":\"add_monitor:$container\"}]"
-            done
-            buttons="$buttons"']}'
-            
-            edit_message "$chat_id" "$message_id" "请选择要添加监控的容器：" "$buttons"
-            ;;
-            
-        add_monitor)
-            remove_from_excluded "$param"
-            answer_callback "$callback_query_id" "已添加到监控列表"
-            edit_message "$chat_id" "$message_id" "✅ 已将 <code>$param</code> 添加到监控列表"
-            ;;
-            
-        monitor:remove)
-            answer_callback "$callback_query_id" "选择要移除监控的容器"
-            
-            monitored=$(get_monitored_containers)
-            if [ -z "$monitored" ]; then
-                edit_message "$chat_id" "$message_id" "⚠️ 当前没有监控中的容器"
-                return
-            fi
-            
-            buttons='{"inline_keyboard":['
-            first=true
-            for container in $monitored; do
-                if [ "$first" = true ]; then
-                    first=false
-                else
-                    buttons="$buttons,"
-                fi
-                buttons="$buttons[{\"text\":\"➖ $container\",\"callback_data\":\"remove_monitor:$container\"}]"
-            done
-            buttons="$buttons"']}'
-            
-            edit_message "$chat_id" "$message_id" "请选择要移除监控的容器：" "$buttons"
-            ;;
-            
-        remove_monitor)
-            add_to_excluded "$param"
-            answer_callback "$callback_query_id" "已从监控列表移除"
-            edit_message "$chat_id" "$message_id" "✅ 已将 <code>$param</code> 从监控列表移除"
-            ;;
-            
-        monitor:list)
-            handle_status_command "$chat_id"
-            answer_callback "$callback_query_id" "已刷新状态"
-            ;;
-            
-        cancel)
-            answer_callback "$callback_query_id" "已取消操作"
-            edit_message "$chat_id" "$message_id" "❌ 操作已取消"
-            ;;
-    esac
-}
-
 # ==================== 机器人消息处理循环 ====================
 
 bot_handler() {
@@ -644,11 +315,11 @@ bot_handler() {
             if [ -n "$message" ] && [ "$message" != "null" ] && [ "$chat_id" = "$CHAT_ID" ]; then
                 case "$message" in
                     /status*) handle_status_command "$chat_id" ;;
-                    /update*) handle_update_command "$chat_id" "$message_id" ;;
-                    /restart*) handle_restart_command "$chat_id" "$message_id" ;;
+                    /update*) handle_update_command "$chat_id" ;;
+                    /restart*) handle_restart_command "$chat_id" ;;
                     /monitor*) handle_monitor_command "$chat_id" ;;
-                    /help*) handle_help_command ;;
-                    /start*) handle_help_command ;;
+                    /runonce*) handle_runonce_command "$chat_id" ;;
+                    /help*|/start*) handle_help_command ;;
                 esac
             fi
             
@@ -675,7 +346,7 @@ bot_handler() {
 # ==================== 主程序 ====================
 
 echo "=========================================="
-echo "Docker 容器监控通知服务 v4.0.0"
+echo "Docker 容器监控通知服务 v4.0.1"
 echo "服务器: ${SERVER_NAME}"
 echo "启动时间: $(get_time)"
 echo "机器人: 已启用"
@@ -760,7 +431,7 @@ startup_message="🚀 <b>监控服务启动成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📊 <b>服务信息</b>
-   版本: <code>v4.0.0</code>
+   版本: <code>v4.0.1</code>
    服务器: <code>${SERVER_NAME}</code>
 
 🎯 <b>监控状态</b>
@@ -771,11 +442,12 @@ startup_message="🚀 <b>监控服务启动成功</b>
 ${monitor_list}
 
 🤖 <b>机器人功能</b>
-   /status - 查看状态
+   /status - 查看服务器状态
    /update - 更新容器
    /restart - 重启容器
    /monitor - 监控管理
-   /help - 显示帮助
+   /runonce - 立即检查更新
+   /help - 显示帮助信息
 
 🔄 <b>功能配置</b>
    检查间隔: <code>$((POLL_INTERVAL / 60))分钟</code>
@@ -904,8 +576,888 @@ docker logs -f --tail 0 watchtower 2>&1 | while IFS= read -r line; do
                 img_name=$(echo "$new_tag_full" | sed 's/:.*$//')
                 time=$(date '+%Y-%m-%d %H:%M:%S')
 
-                old_tag=$(echo "$old_tag_full" | grep -oE ':[^:]+ | sed 's/://' || echo "latest")
-                new_tag=$(echo "$new_tag_full" | grep -oE ':[^:]+ | sed 's/://' || echo "latest")
+                old_tag=$(echo "$old_tag_full" | grep -oE ':[^:]+命令处理 ====================
+
+handle_status_command() {
+    chat_id="$1"
+    
+    monitored=$(get_monitored_containers | wc -l)
+    excluded=$(get_excluded_containers | wc -l)
+    total=$(get_all_containers | wc -l)
+    
+    status_msg="📊 <b>服务器状态</b>
+
+━━━━━━━━━━━━━━━━━━━━
+🖥️ <b>服务器信息</b>
+   名称: <code>${SERVER_NAME}</code>
+   时间: <code>$(get_time)</code>
+
+📦 <b>容器统计</b>
+   总计: <code>${total}</code>
+   监控中: <code>${monitored}</code>
+   已排除: <code>${excluded}</code>
+
+🔍 <b>监控列表</b>"
+
+    if [ "$monitored" -eq 0 ]; then
+        status_msg="$status_msg
+   <i>暂无监控容器</i>"
+    else
+        for container in $(get_monitored_containers); do
+            status=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo "false")
+            if [ "$status" = "true" ]; then
+                status_icon="✅"
+            else
+                status_icon="❌"
+            fi
+            
+            image_tag=$(docker inspect --format='{{.Config.Image}}' "$container" 2>/dev/null | sed 's/.*://')
+            status_msg="$status_msg
+   $status_icon <code>$container</code> [$image_tag]"
+        done
+    fi
+
+    if [ "$excluded" -gt 0 ]; then
+        status_msg="$status_msg
+
+🚫 <b>排除列表</b>"
+        for container in $(get_excluded_containers); do
+            status_msg="$status_msg
+   • <code>$container</code>"
+        done
+    fi
+
+    status_msg="$status_msg
+━━━━━━━━━━━━━━━━━━━━"
+
+    send_telegram "$status_msg"
+}
+
+handle_update_command() {
+    chat_id="$1"
+    
+    containers=$(get_monitored_containers)
+    
+    if [ -z "$containers" ]; then
+        send_telegram "⚠️ 当前没有可更新的容器"
+        return
+    fi
+    
+    buttons='{"inline_keyboard":['
+    first=true
+    for container in $containers; do
+        if [ "$first" = true ]; then
+            first=false
+        else
+            buttons="$buttons,"
+        fi
+        buttons="$buttons[{\"text\":\"📦 $container\",\"callback_data\":\"update:$container\"}]"
+    done
+    buttons="$buttons"']}'
+    
+    send_telegram "🔄 <b>选择要更新的容器</b>
+
+━━━━━━━━━━━━━━━━━━━━
+⚠️ 将拉取最新镜像并重启容器
+━━━━━━━━━━━━━━━━━━━━
+
+请选择：" "$buttons"
+}
+
+handle_restart_command() {
+    chat_id="$1"
+    
+    containers=$(get_all_containers)
+    
+    if [ -z "$containers" ]; then
+        send_telegram "⚠️ 当前没有可重启的容器"
+        return
+    fi
+    
+    buttons='{"inline_keyboard":['
+    first=true
+    for container in $containers; do
+        if [ "$first" = true ]; then
+            first=false
+        else
+            buttons="$buttons,"
+        fi
+        buttons="$buttons[{\"text\":\"🔄 $container\",\"callback_data\":\"restart:$container\"}]"
+    done
+    buttons="$buttons"']}'
+    
+    send_telegram "🔄 <b>选择要重启的容器</b>
+
+━━━━━━━━━━━━━━━━━━━━
+⚠️ 将直接重启所选容器
+━━━━━━━━━━━━━━━━━━━━
+
+请选择：" "$buttons"
+}
+
+handle_monitor_command() {
+    chat_id="$1"
+    
+    buttons='{"inline_keyboard":['
+    buttons="$buttons"'[{"text":"➕ 添加监控","callback_data":"monitor:add"}],'
+    buttons="$buttons"'[{"text":"➖ 移除监控","callback_data":"monitor:remove"}],'
+    buttons="$buttons"'[{"text":"📋 查看列表","callback_data":"monitor:list"}]'
+    buttons="$buttons"']}'
+    
+    send_telegram "📡 <b>监控管理</b>
+
+━━━━━━━━━━━━━━━━━━━━
+管理容器自动更新监控列表
+━━━━━━━━━━━━━━━━━━━━
+
+请选择操作：" "$buttons"
+}
+
+handle_runonce_command() {
+    chat_id="$1"
+    
+    send_telegram "🔄 <b>立即执行更新检查</b>
+
+━━━━━━━━━━━━━━━━━━━━
+⏳ 正在触发 Watchtower 检查...
+━━━━━━━━━━━━━━━━━━━━
+
+请稍候，如有更新将自动推送通知"
+    
+    # 触发 Watchtower 立即检查
+    docker exec watchtower sh -c "kill -HUP 1" 2>/dev/null || \
+    send_telegram "❌ 触发失败，请检查 Watchtower 容器状态"
+}
+
+handle_help_command() {
+    help_msg="📖 <b>命令帮助</b>
+
+━━━━━━━━━━━━━━━━━━━━
+<b>可用命令：</b>
+
+/status - 查看服务器状态
+   查看容器列表和监控配置
+
+/update - 更新容器
+   选择容器进行镜像更新
+
+/restart - 重启容器
+   选择容器进行重启操作
+
+/monitor - 监控管理
+   管理自动更新监控列表
+
+/runonce - 立即检查更新
+   手动触发一次更新检查
+
+/help - 显示帮助信息
+━━━━━━━━━━━━━━━━━━━━
+
+💡 <b>提示：</b>
+• 多服务器环境下，消息会标注服务器名称
+• 所有操作都需要二次确认
+• 排除监控的容器不会自动更新"
+
+    send_telegram "$help_msg"
+}
+
+# ==================== 回调处理 ====================
+
+handle_callback() {
+    callback_data="$1"
+    callback_query_id="$2"
+    chat_id="$3"
+    message_id="$4"
+    
+    action=$(echo "$callback_data" | cut -d: -f1)
+    param=$(echo "$callback_data" | cut -d: -f2-)
+    
+    case "$action" in
+        update)
+            answer_callback "$callback_query_id" "正在准备更新..."
+            
+            image_name=$(docker inspect --format='{{.Config.Image}}' "$param" 2>/dev/null || echo "unknown")
+            
+            confirm_msg="⚠️ <b>确认更新</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器名称</b>
+   <code>$param</code>
+
+🎯 <b>镜像信息</b>
+   <code>$image_name</code>
+
+⚠️ <b>此操作将：</b>
+   1. 拉取最新镜像
+   2. 停止当前容器
+   3. 启动新版本容器
+
+<b>是否继续？</b>
+━━━━━━━━━━━━━━━━━━━━"
+            
+            buttons='{"inline_keyboard":['
+            buttons="$buttons"'[{"text":"✅ 确认更新","callback_data":"confirm_update:'"$param"'"}],'
+            buttons="$buttons"'[{"text":"❌ 取消","callback_data":"cancel"}]'
+            buttons="$buttons"']}'
+            
+            edit_message "$chat_id" "$message_id" "$confirm_msg" "$buttons"
+            ;;
+            
+        confirm_update)
+            answer_callback "$callback_query_id" "开始更新容器..."
+            edit_message "$chat_id" "$message_id" "⏳ 正在更新容器 <code>$param</code>
+
+━━━━━━━━━━━━━━━━━━━━
+1️⃣ 拉取最新镜像...
+━━━━━━━━━━━━━━━━━━━━"
+            
+            # 后台执行更新
+            (
+                sleep 1
+                image_name=$(docker inspect --format='{{.Config.Image}}' "$param" 2>/dev/null)
+                old_id=$(docker inspect --format='{{.Image}}' "$param" 2>/dev/null)
+                
+                if docker pull "$image_name" >/dev/null 2>&1; then
+                    edit_message "$chat_id" "$message_id" "⏳ 正在更新容器 <code>$param</code>
+
+━━━━━━━━━━━━━━━━━━━━
+1️⃣ ✅ 镜像拉取成功
+2️⃣ 重启容器中...
+━━━━━━━━━━━━━━━━━━━━"
+                    
+                    if docker restart "$param" >/dev/null 2>&1; then
+                        sleep 3
+                        new_id=$(docker inspect --format='{{.Image}}' "$param" 2>/dev/null)
+                        
+                        if [ "$old_id" != "$new_id" ]; then
+                            result="✅ 更新成功 (镜像已变更)"
+                        else
+                            result="ℹ️ 已是最新版本"
+                        fi
+                        
+                        edit_message "$chat_id" "$message_id" "✅ <b>容器更新完成</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+📊 <b>状态</b>: $result
+⏰ <b>时间</b>: <code>$(get_time)</code>
+━━━━━━━━━━━━━━━━━━━━"
+                    else
+                        edit_message "$chat_id" "$message_id" "❌ <b>更新失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+🔴 <b>错误</b>: 容器重启失败
+━━━━━━━━━━━━━━━━━━━━"
+                    fi
+                else
+                    edit_message "$chat_id" "$message_id" "❌ <b>更新失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+🔴 <b>错误</b>: 镜像拉取失败
+━━━━━━━━━━━━━━━━━━━━"
+                fi
+            ) &
+            ;;
+            
+        restart)
+            answer_callback "$callback_query_id" "正在准备重启..."
+            
+            status=$(docker inspect -f '{{.State.Running}}' "$param" 2>/dev/null || echo "unknown")
+            
+            confirm_msg="⚠️ <b>确认重启</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器名称</b>
+   <code>$param</code>
+
+📊 <b>当前状态</b>
+   $([ "$status" = "true" ] && echo "运行中 ✅" || echo "已停止 ❌")
+
+<b>是否继续？</b>
+━━━━━━━━━━━━━━━━━━━━"
+            
+            buttons='{"inline_keyboard":['
+            buttons="$buttons"'[{"text":"✅ 确认重启","callback_data":"confirm_restart:'"$param"'"}],'
+            buttons="$buttons"'[{"text":"❌ 取消","callback_data":"cancel"}]'
+            buttons="$buttons"']}'
+            
+            edit_message "$chat_id" "$message_id" "$confirm_msg" "$buttons"
+            ;;
+            
+        confirm_restart)
+            answer_callback "$callback_query_id" "开始重启容器..."
+            edit_message "$chat_id" "$message_id" "⏳ 正在重启容器 <code>$param</code>..."
+            
+            if docker restart "$param" >/dev/null 2>&1; then
+                result_msg="✅ <b>重启成功</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+⏰ <b>时间</b>: <code>$(get_time)</code>
+━━━━━━━━━━━━━━━━━━━━"
+            else
+                result_msg="❌ <b>重启失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+🔴 <b>错误</b>: 重启操作失败
+💡 <b>建议</b>: 检查容器日志
+━━━━━━━━━━━━━━━━━━━━"
+            fi
+            
+            edit_message "$chat_id" "$message_id" "$result_msg"
+            ;;
+            
+        monitor:add)
+            answer_callback "$callback_query_id" "选择要添加监控的容器"
+            
+            excluded=$(get_excluded_containers)
+            if [ -z "$excluded" ]; then
+                edit_message "$chat_id" "$message_id" "✅ 所有容器都已在监控中
+
+━━━━━━━━━━━━━━━━━━━━
+使用 /status 查看监控列表
+━━━━━━━━━━━━━━━━━━━━"
+                return
+            fi
+            
+            buttons='{"inline_keyboard":['
+            first=true
+            for container in $excluded; do
+                if [ "$first" = true ]; then
+                    first=false
+                else
+                    buttons="$buttons,"
+                fi
+                buttons="$buttons[{\"text\":\"➕ $container\",\"callback_data\":\"add_monitor:$container\"}]"
+            done
+            buttons="$buttons"']}'
+            
+            edit_message "$chat_id" "$message_id" "➕ <b>添加监控</b>
+
+━━━━━━━━━━━━━━━━━━━━
+选择要添加到监控列表的容器
+━━━━━━━━━━━━━━━━━━━━
+
+请选择：" "$buttons"
+            ;;
+            
+        add_monitor)
+            remove_from_excluded "$param"
+            answer_callback "$callback_query_id" "已添加到监控列表"
+            edit_message "$chat_id" "$message_id" "✅ <b>添加成功</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 容器: <code>$param</code>
+📡 已添加到自动更新监控列表
+━━━━━━━━━━━━━━━━━━━━"
+            ;;
+            
+        monitor:remove)
+            answer_callback "$callback_query_id" "选择要移除监控的容器"
+            
+            monitored=$(get_monitored_containers)
+            if [ -z "$monitored" ]; then
+                edit_message "$chat_id" "$message_id" "⚠️ 当前没有监控中的容器
+
+━━━━━━━━━━━━━━━━━━━━
+使用 /status 查看监控列表
+━━━━━━━━━━━━━━━━━━━━"
+                return
+            fi
+            
+            buttons='{"inline_keyboard":['
+            first=true
+            for container in $monitored; do
+                if [ "$first" = true ]; then
+                    first=false
+                else
+                    buttons="$buttons,"
+                fi
+                buttons="$buttons[{\"text\":\"➖ $container\",\"callback_data\":\"remove_monitor:$container\"}]"
+            done
+            buttons="$buttons"']}'
+            
+            edit_message "$chat_id" "$message_id" "➖ <b>移除监控</b>
+
+━━━━━━━━━━━━━━━━━━━━
+选择要从监控列表移除的容器
+━━━━━━━━━━━━━━━━━━━━
+
+请选择：" "$buttons"
+            ;;
+            
+        remove_monitor)
+            add_to_excluded "$param"
+            answer_callback "$callback_query_id" "已从监控列表移除"
+            edit_message "$chat_id" "$message_id" "✅ <b>移除成功</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 容器: <code>$param</code>
+🚫 已从自动更新监控列表移除
+━━━━━━━━━━━━━━━━━━━━"
+            ;;
+            
+        monitor:list)
+            handle_status_command "$chat_id"
+            answer_callback "$callback_query_id" "已刷新状态"
+            ;;
+            
+        cancel)
+            answer_callback "$callback_query_id" "已取消操作"
+            edit_message "$chat_id" "$message_id" "❌ <b>操作已取消</b>
+
+━━━━━━━━━━━━━━━━━━━━
+使用 /help 查看可用命令
+━━━━━━━━━━━━━━━━━━━━"
+            ;;
+    esac
+}
+
+# ==================== 机器人 | sed 's/://' || echo "latest")
+                new_tag=$(echo "$new_tag_full" | grep -oE ':[^:]+命令处理 ====================
+
+handle_status_command() {
+    chat_id="$1"
+    
+    monitored=$(get_monitored_containers | wc -l)
+    excluded=$(get_excluded_containers | wc -l)
+    total=$(get_all_containers | wc -l)
+    
+    status_msg="📊 <b>服务器状态</b>
+
+━━━━━━━━━━━━━━━━━━━━
+🖥️ <b>服务器信息</b>
+   名称: <code>${SERVER_NAME}</code>
+   时间: <code>$(get_time)</code>
+
+📦 <b>容器统计</b>
+   总计: <code>${total}</code>
+   监控中: <code>${monitored}</code>
+   已排除: <code>${excluded}</code>
+
+🔍 <b>监控列表</b>"
+
+    if [ "$monitored" -eq 0 ]; then
+        status_msg="$status_msg
+   <i>暂无监控容器</i>"
+    else
+        for container in $(get_monitored_containers); do
+            status=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo "false")
+            if [ "$status" = "true" ]; then
+                status_icon="✅"
+            else
+                status_icon="❌"
+            fi
+            
+            image_tag=$(docker inspect --format='{{.Config.Image}}' "$container" 2>/dev/null | sed 's/.*://')
+            status_msg="$status_msg
+   $status_icon <code>$container</code> [$image_tag]"
+        done
+    fi
+
+    if [ "$excluded" -gt 0 ]; then
+        status_msg="$status_msg
+
+🚫 <b>排除列表</b>"
+        for container in $(get_excluded_containers); do
+            status_msg="$status_msg
+   • <code>$container</code>"
+        done
+    fi
+
+    status_msg="$status_msg
+━━━━━━━━━━━━━━━━━━━━"
+
+    send_telegram "$status_msg"
+}
+
+handle_update_command() {
+    chat_id="$1"
+    
+    containers=$(get_monitored_containers)
+    
+    if [ -z "$containers" ]; then
+        send_telegram "⚠️ 当前没有可更新的容器"
+        return
+    fi
+    
+    buttons='{"inline_keyboard":['
+    first=true
+    for container in $containers; do
+        if [ "$first" = true ]; then
+            first=false
+        else
+            buttons="$buttons,"
+        fi
+        buttons="$buttons[{\"text\":\"📦 $container\",\"callback_data\":\"update:$container\"}]"
+    done
+    buttons="$buttons"']}'
+    
+    send_telegram "🔄 <b>选择要更新的容器</b>
+
+━━━━━━━━━━━━━━━━━━━━
+⚠️ 将拉取最新镜像并重启容器
+━━━━━━━━━━━━━━━━━━━━
+
+请选择：" "$buttons"
+}
+
+handle_restart_command() {
+    chat_id="$1"
+    
+    containers=$(get_all_containers)
+    
+    if [ -z "$containers" ]; then
+        send_telegram "⚠️ 当前没有可重启的容器"
+        return
+    fi
+    
+    buttons='{"inline_keyboard":['
+    first=true
+    for container in $containers; do
+        if [ "$first" = true ]; then
+            first=false
+        else
+            buttons="$buttons,"
+        fi
+        buttons="$buttons[{\"text\":\"🔄 $container\",\"callback_data\":\"restart:$container\"}]"
+    done
+    buttons="$buttons"']}'
+    
+    send_telegram "🔄 <b>选择要重启的容器</b>
+
+━━━━━━━━━━━━━━━━━━━━
+⚠️ 将直接重启所选容器
+━━━━━━━━━━━━━━━━━━━━
+
+请选择：" "$buttons"
+}
+
+handle_monitor_command() {
+    chat_id="$1"
+    
+    buttons='{"inline_keyboard":['
+    buttons="$buttons"'[{"text":"➕ 添加监控","callback_data":"monitor:add"}],'
+    buttons="$buttons"'[{"text":"➖ 移除监控","callback_data":"monitor:remove"}],'
+    buttons="$buttons"'[{"text":"📋 查看列表","callback_data":"monitor:list"}]'
+    buttons="$buttons"']}'
+    
+    send_telegram "📡 <b>监控管理</b>
+
+━━━━━━━━━━━━━━━━━━━━
+管理容器自动更新监控列表
+━━━━━━━━━━━━━━━━━━━━
+
+请选择操作：" "$buttons"
+}
+
+handle_runonce_command() {
+    chat_id="$1"
+    
+    send_telegram "🔄 <b>立即执行更新检查</b>
+
+━━━━━━━━━━━━━━━━━━━━
+⏳ 正在触发 Watchtower 检查...
+━━━━━━━━━━━━━━━━━━━━
+
+请稍候，如有更新将自动推送通知"
+    
+    # 触发 Watchtower 立即检查
+    docker exec watchtower sh -c "kill -HUP 1" 2>/dev/null || \
+    send_telegram "❌ 触发失败，请检查 Watchtower 容器状态"
+}
+
+handle_help_command() {
+    help_msg="📖 <b>命令帮助</b>
+
+━━━━━━━━━━━━━━━━━━━━
+<b>可用命令：</b>
+
+/status - 查看服务器状态
+   查看容器列表和监控配置
+
+/update - 更新容器
+   选择容器进行镜像更新
+
+/restart - 重启容器
+   选择容器进行重启操作
+
+/monitor - 监控管理
+   管理自动更新监控列表
+
+/runonce - 立即检查更新
+   手动触发一次更新检查
+
+/help - 显示帮助信息
+━━━━━━━━━━━━━━━━━━━━
+
+💡 <b>提示：</b>
+• 多服务器环境下，消息会标注服务器名称
+• 所有操作都需要二次确认
+• 排除监控的容器不会自动更新"
+
+    send_telegram "$help_msg"
+}
+
+# ==================== 回调处理 ====================
+
+handle_callback() {
+    callback_data="$1"
+    callback_query_id="$2"
+    chat_id="$3"
+    message_id="$4"
+    
+    action=$(echo "$callback_data" | cut -d: -f1)
+    param=$(echo "$callback_data" | cut -d: -f2-)
+    
+    case "$action" in
+        update)
+            answer_callback "$callback_query_id" "正在准备更新..."
+            
+            image_name=$(docker inspect --format='{{.Config.Image}}' "$param" 2>/dev/null || echo "unknown")
+            
+            confirm_msg="⚠️ <b>确认更新</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器名称</b>
+   <code>$param</code>
+
+🎯 <b>镜像信息</b>
+   <code>$image_name</code>
+
+⚠️ <b>此操作将：</b>
+   1. 拉取最新镜像
+   2. 停止当前容器
+   3. 启动新版本容器
+
+<b>是否继续？</b>
+━━━━━━━━━━━━━━━━━━━━"
+            
+            buttons='{"inline_keyboard":['
+            buttons="$buttons"'[{"text":"✅ 确认更新","callback_data":"confirm_update:'"$param"'"}],'
+            buttons="$buttons"'[{"text":"❌ 取消","callback_data":"cancel"}]'
+            buttons="$buttons"']}'
+            
+            edit_message "$chat_id" "$message_id" "$confirm_msg" "$buttons"
+            ;;
+            
+        confirm_update)
+            answer_callback "$callback_query_id" "开始更新容器..."
+            edit_message "$chat_id" "$message_id" "⏳ 正在更新容器 <code>$param</code>
+
+━━━━━━━━━━━━━━━━━━━━
+1️⃣ 拉取最新镜像...
+━━━━━━━━━━━━━━━━━━━━"
+            
+            # 后台执行更新
+            (
+                sleep 1
+                image_name=$(docker inspect --format='{{.Config.Image}}' "$param" 2>/dev/null)
+                old_id=$(docker inspect --format='{{.Image}}' "$param" 2>/dev/null)
+                
+                if docker pull "$image_name" >/dev/null 2>&1; then
+                    edit_message "$chat_id" "$message_id" "⏳ 正在更新容器 <code>$param</code>
+
+━━━━━━━━━━━━━━━━━━━━
+1️⃣ ✅ 镜像拉取成功
+2️⃣ 重启容器中...
+━━━━━━━━━━━━━━━━━━━━"
+                    
+                    if docker restart "$param" >/dev/null 2>&1; then
+                        sleep 3
+                        new_id=$(docker inspect --format='{{.Image}}' "$param" 2>/dev/null)
+                        
+                        if [ "$old_id" != "$new_id" ]; then
+                            result="✅ 更新成功 (镜像已变更)"
+                        else
+                            result="ℹ️ 已是最新版本"
+                        fi
+                        
+                        edit_message "$chat_id" "$message_id" "✅ <b>容器更新完成</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+📊 <b>状态</b>: $result
+⏰ <b>时间</b>: <code>$(get_time)</code>
+━━━━━━━━━━━━━━━━━━━━"
+                    else
+                        edit_message "$chat_id" "$message_id" "❌ <b>更新失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+🔴 <b>错误</b>: 容器重启失败
+━━━━━━━━━━━━━━━━━━━━"
+                    fi
+                else
+                    edit_message "$chat_id" "$message_id" "❌ <b>更新失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+🔴 <b>错误</b>: 镜像拉取失败
+━━━━━━━━━━━━━━━━━━━━"
+                fi
+            ) &
+            ;;
+            
+        restart)
+            answer_callback "$callback_query_id" "正在准备重启..."
+            
+            status=$(docker inspect -f '{{.State.Running}}' "$param" 2>/dev/null || echo "unknown")
+            
+            confirm_msg="⚠️ <b>确认重启</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器名称</b>
+   <code>$param</code>
+
+📊 <b>当前状态</b>
+   $([ "$status" = "true" ] && echo "运行中 ✅" || echo "已停止 ❌")
+
+<b>是否继续？</b>
+━━━━━━━━━━━━━━━━━━━━"
+            
+            buttons='{"inline_keyboard":['
+            buttons="$buttons"'[{"text":"✅ 确认重启","callback_data":"confirm_restart:'"$param"'"}],'
+            buttons="$buttons"'[{"text":"❌ 取消","callback_data":"cancel"}]'
+            buttons="$buttons"']}'
+            
+            edit_message "$chat_id" "$message_id" "$confirm_msg" "$buttons"
+            ;;
+            
+        confirm_restart)
+            answer_callback "$callback_query_id" "开始重启容器..."
+            edit_message "$chat_id" "$message_id" "⏳ 正在重启容器 <code>$param</code>..."
+            
+            if docker restart "$param" >/dev/null 2>&1; then
+                result_msg="✅ <b>重启成功</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+⏰ <b>时间</b>: <code>$(get_time)</code>
+━━━━━━━━━━━━━━━━━━━━"
+            else
+                result_msg="❌ <b>重启失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+🔴 <b>错误</b>: 重启操作失败
+💡 <b>建议</b>: 检查容器日志
+━━━━━━━━━━━━━━━━━━━━"
+            fi
+            
+            edit_message "$chat_id" "$message_id" "$result_msg"
+            ;;
+            
+        monitor:add)
+            answer_callback "$callback_query_id" "选择要添加监控的容器"
+            
+            excluded=$(get_excluded_containers)
+            if [ -z "$excluded" ]; then
+                edit_message "$chat_id" "$message_id" "✅ 所有容器都已在监控中
+
+━━━━━━━━━━━━━━━━━━━━
+使用 /status 查看监控列表
+━━━━━━━━━━━━━━━━━━━━"
+                return
+            fi
+            
+            buttons='{"inline_keyboard":['
+            first=true
+            for container in $excluded; do
+                if [ "$first" = true ]; then
+                    first=false
+                else
+                    buttons="$buttons,"
+                fi
+                buttons="$buttons[{\"text\":\"➕ $container\",\"callback_data\":\"add_monitor:$container\"}]"
+            done
+            buttons="$buttons"']}'
+            
+            edit_message "$chat_id" "$message_id" "➕ <b>添加监控</b>
+
+━━━━━━━━━━━━━━━━━━━━
+选择要添加到监控列表的容器
+━━━━━━━━━━━━━━━━━━━━
+
+请选择：" "$buttons"
+            ;;
+            
+        add_monitor)
+            remove_from_excluded "$param"
+            answer_callback "$callback_query_id" "已添加到监控列表"
+            edit_message "$chat_id" "$message_id" "✅ <b>添加成功</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 容器: <code>$param</code>
+📡 已添加到自动更新监控列表
+━━━━━━━━━━━━━━━━━━━━"
+            ;;
+            
+        monitor:remove)
+            answer_callback "$callback_query_id" "选择要移除监控的容器"
+            
+            monitored=$(get_monitored_containers)
+            if [ -z "$monitored" ]; then
+                edit_message "$chat_id" "$message_id" "⚠️ 当前没有监控中的容器
+
+━━━━━━━━━━━━━━━━━━━━
+使用 /status 查看监控列表
+━━━━━━━━━━━━━━━━━━━━"
+                return
+            fi
+            
+            buttons='{"inline_keyboard":['
+            first=true
+            for container in $monitored; do
+                if [ "$first" = true ]; then
+                    first=false
+                else
+                    buttons="$buttons,"
+                fi
+                buttons="$buttons[{\"text\":\"➖ $container\",\"callback_data\":\"remove_monitor:$container\"}]"
+            done
+            buttons="$buttons"']}'
+            
+            edit_message "$chat_id" "$message_id" "➖ <b>移除监控</b>
+
+━━━━━━━━━━━━━━━━━━━━
+选择要从监控列表移除的容器
+━━━━━━━━━━━━━━━━━━━━
+
+请选择：" "$buttons"
+            ;;
+            
+        remove_monitor)
+            add_to_excluded "$param"
+            answer_callback "$callback_query_id" "已从监控列表移除"
+            edit_message "$chat_id" "$message_id" "✅ <b>移除成功</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 容器: <code>$param</code>
+🚫 已从自动更新监控列表移除
+━━━━━━━━━━━━━━━━━━━━"
+            ;;
+            
+        monitor:list)
+            handle_status_command "$chat_id"
+            answer_callback "$callback_query_id" "已刷新状态"
+            ;;
+            
+        cancel)
+            answer_callback "$callback_query_id" "已取消操作"
+            edit_message "$chat_id" "$message_id" "❌ <b>操作已取消</b>
+
+━━━━━━━━━━━━━━━━━━━━
+使用 /help 查看可用命令
+━━━━━━━━━━━━━━━━━━━━"
+            ;;
+    esac
+}
+
+# ==================== 机器人 | sed 's/://' || echo "latest")
                 old_id_short=$(echo "$old_id_full" | sed 's/sha256://' | head -c 12)
                 new_id_short=$(echo "$new_id_full" | sed 's/sha256://' | head -c 12)
 
@@ -1005,4 +1557,444 @@ docker logs -f --tail 0 watchtower 2>&1 | while IFS= read -r line; do
     fi
 done
 
-cleanup
+cleanup命令处理 ====================
+
+handle_status_command() {
+    chat_id="$1"
+    
+    monitored=$(get_monitored_containers | wc -l)
+    excluded=$(get_excluded_containers | wc -l)
+    total=$(get_all_containers | wc -l)
+    
+    status_msg="📊 <b>服务器状态</b>
+
+━━━━━━━━━━━━━━━━━━━━
+🖥️ <b>服务器信息</b>
+   名称: <code>${SERVER_NAME}</code>
+   时间: <code>$(get_time)</code>
+
+📦 <b>容器统计</b>
+   总计: <code>${total}</code>
+   监控中: <code>${monitored}</code>
+   已排除: <code>${excluded}</code>
+
+🔍 <b>监控列表</b>"
+
+    if [ "$monitored" -eq 0 ]; then
+        status_msg="$status_msg
+   <i>暂无监控容器</i>"
+    else
+        for container in $(get_monitored_containers); do
+            status=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo "false")
+            if [ "$status" = "true" ]; then
+                status_icon="✅"
+            else
+                status_icon="❌"
+            fi
+            
+            image_tag=$(docker inspect --format='{{.Config.Image}}' "$container" 2>/dev/null | sed 's/.*://')
+            status_msg="$status_msg
+   $status_icon <code>$container</code> [$image_tag]"
+        done
+    fi
+
+    if [ "$excluded" -gt 0 ]; then
+        status_msg="$status_msg
+
+🚫 <b>排除列表</b>"
+        for container in $(get_excluded_containers); do
+            status_msg="$status_msg
+   • <code>$container</code>"
+        done
+    fi
+
+    status_msg="$status_msg
+━━━━━━━━━━━━━━━━━━━━"
+
+    send_telegram "$status_msg"
+}
+
+handle_update_command() {
+    chat_id="$1"
+    
+    containers=$(get_monitored_containers)
+    
+    if [ -z "$containers" ]; then
+        send_telegram "⚠️ 当前没有可更新的容器"
+        return
+    fi
+    
+    buttons='{"inline_keyboard":['
+    first=true
+    for container in $containers; do
+        if [ "$first" = true ]; then
+            first=false
+        else
+            buttons="$buttons,"
+        fi
+        buttons="$buttons[{\"text\":\"📦 $container\",\"callback_data\":\"update:$container\"}]"
+    done
+    buttons="$buttons"']}'
+    
+    send_telegram "🔄 <b>选择要更新的容器</b>
+
+━━━━━━━━━━━━━━━━━━━━
+⚠️ 将拉取最新镜像并重启容器
+━━━━━━━━━━━━━━━━━━━━
+
+请选择：" "$buttons"
+}
+
+handle_restart_command() {
+    chat_id="$1"
+    
+    containers=$(get_all_containers)
+    
+    if [ -z "$containers" ]; then
+        send_telegram "⚠️ 当前没有可重启的容器"
+        return
+    fi
+    
+    buttons='{"inline_keyboard":['
+    first=true
+    for container in $containers; do
+        if [ "$first" = true ]; then
+            first=false
+        else
+            buttons="$buttons,"
+        fi
+        buttons="$buttons[{\"text\":\"🔄 $container\",\"callback_data\":\"restart:$container\"}]"
+    done
+    buttons="$buttons"']}'
+    
+    send_telegram "🔄 <b>选择要重启的容器</b>
+
+━━━━━━━━━━━━━━━━━━━━
+⚠️ 将直接重启所选容器
+━━━━━━━━━━━━━━━━━━━━
+
+请选择：" "$buttons"
+}
+
+handle_monitor_command() {
+    chat_id="$1"
+    
+    buttons='{"inline_keyboard":['
+    buttons="$buttons"'[{"text":"➕ 添加监控","callback_data":"monitor:add"}],'
+    buttons="$buttons"'[{"text":"➖ 移除监控","callback_data":"monitor:remove"}],'
+    buttons="$buttons"'[{"text":"📋 查看列表","callback_data":"monitor:list"}]'
+    buttons="$buttons"']}'
+    
+    send_telegram "📡 <b>监控管理</b>
+
+━━━━━━━━━━━━━━━━━━━━
+管理容器自动更新监控列表
+━━━━━━━━━━━━━━━━━━━━
+
+请选择操作：" "$buttons"
+}
+
+handle_runonce_command() {
+    chat_id="$1"
+    
+    send_telegram "🔄 <b>立即执行更新检查</b>
+
+━━━━━━━━━━━━━━━━━━━━
+⏳ 正在触发 Watchtower 检查...
+━━━━━━━━━━━━━━━━━━━━
+
+请稍候，如有更新将自动推送通知"
+    
+    # 触发 Watchtower 立即检查
+    docker exec watchtower sh -c "kill -HUP 1" 2>/dev/null || \
+    send_telegram "❌ 触发失败，请检查 Watchtower 容器状态"
+}
+
+handle_help_command() {
+    help_msg="📖 <b>命令帮助</b>
+
+━━━━━━━━━━━━━━━━━━━━
+<b>可用命令：</b>
+
+/status - 查看服务器状态
+   查看容器列表和监控配置
+
+/update - 更新容器
+   选择容器进行镜像更新
+
+/restart - 重启容器
+   选择容器进行重启操作
+
+/monitor - 监控管理
+   管理自动更新监控列表
+
+/runonce - 立即检查更新
+   手动触发一次更新检查
+
+/help - 显示帮助信息
+━━━━━━━━━━━━━━━━━━━━
+
+💡 <b>提示：</b>
+• 多服务器环境下，消息会标注服务器名称
+• 所有操作都需要二次确认
+• 排除监控的容器不会自动更新"
+
+    send_telegram "$help_msg"
+}
+
+# ==================== 回调处理 ====================
+
+handle_callback() {
+    callback_data="$1"
+    callback_query_id="$2"
+    chat_id="$3"
+    message_id="$4"
+    
+    action=$(echo "$callback_data" | cut -d: -f1)
+    param=$(echo "$callback_data" | cut -d: -f2-)
+    
+    case "$action" in
+        update)
+            answer_callback "$callback_query_id" "正在准备更新..."
+            
+            image_name=$(docker inspect --format='{{.Config.Image}}' "$param" 2>/dev/null || echo "unknown")
+            
+            confirm_msg="⚠️ <b>确认更新</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器名称</b>
+   <code>$param</code>
+
+🎯 <b>镜像信息</b>
+   <code>$image_name</code>
+
+⚠️ <b>此操作将：</b>
+   1. 拉取最新镜像
+   2. 停止当前容器
+   3. 启动新版本容器
+
+<b>是否继续？</b>
+━━━━━━━━━━━━━━━━━━━━"
+            
+            buttons='{"inline_keyboard":['
+            buttons="$buttons"'[{"text":"✅ 确认更新","callback_data":"confirm_update:'"$param"'"}],'
+            buttons="$buttons"'[{"text":"❌ 取消","callback_data":"cancel"}]'
+            buttons="$buttons"']}'
+            
+            edit_message "$chat_id" "$message_id" "$confirm_msg" "$buttons"
+            ;;
+            
+        confirm_update)
+            answer_callback "$callback_query_id" "开始更新容器..."
+            edit_message "$chat_id" "$message_id" "⏳ 正在更新容器 <code>$param</code>
+
+━━━━━━━━━━━━━━━━━━━━
+1️⃣ 拉取最新镜像...
+━━━━━━━━━━━━━━━━━━━━"
+            
+            # 后台执行更新
+            (
+                sleep 1
+                image_name=$(docker inspect --format='{{.Config.Image}}' "$param" 2>/dev/null)
+                old_id=$(docker inspect --format='{{.Image}}' "$param" 2>/dev/null)
+                
+                if docker pull "$image_name" >/dev/null 2>&1; then
+                    edit_message "$chat_id" "$message_id" "⏳ 正在更新容器 <code>$param</code>
+
+━━━━━━━━━━━━━━━━━━━━
+1️⃣ ✅ 镜像拉取成功
+2️⃣ 重启容器中...
+━━━━━━━━━━━━━━━━━━━━"
+                    
+                    if docker restart "$param" >/dev/null 2>&1; then
+                        sleep 3
+                        new_id=$(docker inspect --format='{{.Image}}' "$param" 2>/dev/null)
+                        
+                        if [ "$old_id" != "$new_id" ]; then
+                            result="✅ 更新成功 (镜像已变更)"
+                        else
+                            result="ℹ️ 已是最新版本"
+                        fi
+                        
+                        edit_message "$chat_id" "$message_id" "✅ <b>容器更新完成</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+📊 <b>状态</b>: $result
+⏰ <b>时间</b>: <code>$(get_time)</code>
+━━━━━━━━━━━━━━━━━━━━"
+                    else
+                        edit_message "$chat_id" "$message_id" "❌ <b>更新失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+🔴 <b>错误</b>: 容器重启失败
+━━━━━━━━━━━━━━━━━━━━"
+                    fi
+                else
+                    edit_message "$chat_id" "$message_id" "❌ <b>更新失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+🔴 <b>错误</b>: 镜像拉取失败
+━━━━━━━━━━━━━━━━━━━━"
+                fi
+            ) &
+            ;;
+            
+        restart)
+            answer_callback "$callback_query_id" "正在准备重启..."
+            
+            status=$(docker inspect -f '{{.State.Running}}' "$param" 2>/dev/null || echo "unknown")
+            
+            confirm_msg="⚠️ <b>确认重启</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器名称</b>
+   <code>$param</code>
+
+📊 <b>当前状态</b>
+   $([ "$status" = "true" ] && echo "运行中 ✅" || echo "已停止 ❌")
+
+<b>是否继续？</b>
+━━━━━━━━━━━━━━━━━━━━"
+            
+            buttons='{"inline_keyboard":['
+            buttons="$buttons"'[{"text":"✅ 确认重启","callback_data":"confirm_restart:'"$param"'"}],'
+            buttons="$buttons"'[{"text":"❌ 取消","callback_data":"cancel"}]'
+            buttons="$buttons"']}'
+            
+            edit_message "$chat_id" "$message_id" "$confirm_msg" "$buttons"
+            ;;
+            
+        confirm_restart)
+            answer_callback "$callback_query_id" "开始重启容器..."
+            edit_message "$chat_id" "$message_id" "⏳ 正在重启容器 <code>$param</code>..."
+            
+            if docker restart "$param" >/dev/null 2>&1; then
+                result_msg="✅ <b>重启成功</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+⏰ <b>时间</b>: <code>$(get_time)</code>
+━━━━━━━━━━━━━━━━━━━━"
+            else
+                result_msg="❌ <b>重启失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器</b>: <code>$param</code>
+🔴 <b>错误</b>: 重启操作失败
+💡 <b>建议</b>: 检查容器日志
+━━━━━━━━━━━━━━━━━━━━"
+            fi
+            
+            edit_message "$chat_id" "$message_id" "$result_msg"
+            ;;
+            
+        monitor:add)
+            answer_callback "$callback_query_id" "选择要添加监控的容器"
+            
+            excluded=$(get_excluded_containers)
+            if [ -z "$excluded" ]; then
+                edit_message "$chat_id" "$message_id" "✅ 所有容器都已在监控中
+
+━━━━━━━━━━━━━━━━━━━━
+使用 /status 查看监控列表
+━━━━━━━━━━━━━━━━━━━━"
+                return
+            fi
+            
+            buttons='{"inline_keyboard":['
+            first=true
+            for container in $excluded; do
+                if [ "$first" = true ]; then
+                    first=false
+                else
+                    buttons="$buttons,"
+                fi
+                buttons="$buttons[{\"text\":\"➕ $container\",\"callback_data\":\"add_monitor:$container\"}]"
+            done
+            buttons="$buttons"']}'
+            
+            edit_message "$chat_id" "$message_id" "➕ <b>添加监控</b>
+
+━━━━━━━━━━━━━━━━━━━━
+选择要添加到监控列表的容器
+━━━━━━━━━━━━━━━━━━━━
+
+请选择：" "$buttons"
+            ;;
+            
+        add_monitor)
+            remove_from_excluded "$param"
+            answer_callback "$callback_query_id" "已添加到监控列表"
+            edit_message "$chat_id" "$message_id" "✅ <b>添加成功</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 容器: <code>$param</code>
+📡 已添加到自动更新监控列表
+━━━━━━━━━━━━━━━━━━━━"
+            ;;
+            
+        monitor:remove)
+            answer_callback "$callback_query_id" "选择要移除监控的容器"
+            
+            monitored=$(get_monitored_containers)
+            if [ -z "$monitored" ]; then
+                edit_message "$chat_id" "$message_id" "⚠️ 当前没有监控中的容器
+
+━━━━━━━━━━━━━━━━━━━━
+使用 /status 查看监控列表
+━━━━━━━━━━━━━━━━━━━━"
+                return
+            fi
+            
+            buttons='{"inline_keyboard":['
+            first=true
+            for container in $monitored; do
+                if [ "$first" = true ]; then
+                    first=false
+                else
+                    buttons="$buttons,"
+                fi
+                buttons="$buttons[{\"text\":\"➖ $container\",\"callback_data\":\"remove_monitor:$container\"}]"
+            done
+            buttons="$buttons"']}'
+            
+            edit_message "$chat_id" "$message_id" "➖ <b>移除监控</b>
+
+━━━━━━━━━━━━━━━━━━━━
+选择要从监控列表移除的容器
+━━━━━━━━━━━━━━━━━━━━
+
+请选择：" "$buttons"
+            ;;
+            
+        remove_monitor)
+            add_to_excluded "$param"
+            answer_callback "$callback_query_id" "已从监控列表移除"
+            edit_message "$chat_id" "$message_id" "✅ <b>移除成功</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 容器: <code>$param</code>
+🚫 已从自动更新监控列表移除
+━━━━━━━━━━━━━━━━━━━━"
+            ;;
+            
+        monitor:list)
+            handle_status_command "$chat_id"
+            answer_callback "$callback_query_id" "已刷新状态"
+            ;;
+            
+        cancel)
+            answer_callback "$callback_query_id" "已取消操作"
+            edit_message "$chat_id" "$message_id" "❌ <b>操作已取消</b>
+
+━━━━━━━━━━━━━━━━━━━━
+使用 /help 查看可用命令
+━━━━━━━━━━━━━━━━━━━━"
+            ;;
+    esac
+}
+
+# ==================== 机器人
