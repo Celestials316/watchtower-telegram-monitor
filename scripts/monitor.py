@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Docker 容器监控通知服务 v5.2.0
-修复多服务器响应和回调处理问题
+Docker 容器监控通知服务 v5.2.1
+修复 NFS 文件同步和 JSON 读写冲突问题
 """
 
 import os
@@ -13,6 +13,7 @@ import signal
 import subprocess
 import threading
 import logging
+import fcntl
 from datetime import datetime
 from typing import Dict, List, Optional, Set
 import requests
@@ -20,7 +21,7 @@ from pathlib import Path
 
 # ==================== 配置和常量 ====================
 
-VERSION = "5.2.0"
+VERSION = "5.2.1"
 TELEGRAM_API = f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN')}"
 CHAT_ID = os.getenv('CHAT_ID')
 SERVER_NAME = os.getenv('SERVER_NAME')
@@ -44,6 +45,119 @@ logger = logging.getLogger(__name__)
 
 # 全局变量
 shutdown_flag = threading.Event()
+
+
+# ==================== 文件锁管理器 ====================
+
+class FileLock:
+    """文件锁上下文管理器"""
+    
+    def __init__(self, file_path: Path, timeout: int = 10):
+        self.file_path = file_path
+        self.timeout = timeout
+        self.lock_file = None
+        
+    def __enter__(self):
+        lock_path = str(self.file_path) + '.lock'
+        self.lock_file = open(lock_path, 'w')
+        
+        start_time = time.time()
+        while True:
+            try:
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except IOError:
+                if time.time() - start_time > self.timeout:
+                    raise TimeoutError(f"无法获取文件锁: {self.file_path}")
+                time.sleep(0.1)
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.lock_file:
+            try:
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+                self.lock_file.close()
+            except Exception as e:
+                logger.error(f"释放文件锁失败: {e}")
+
+
+def safe_read_json(file_path: Path, default: Dict = None, max_retries: int = 3) -> Dict:
+    """安全读取 JSON 文件（带重试和文件锁）"""
+    if default is None:
+        default = {}
+    
+    for attempt in range(max_retries):
+        try:
+            if not file_path.exists():
+                logger.debug(f"文件不存在，返回默认值: {file_path}")
+                return default.copy()
+            
+            # 使用文件锁
+            with FileLock(file_path, timeout=5):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    
+                    # 检查文件是否为空
+                    if not content:
+                        logger.warning(f"文件为空: {file_path}")
+                        return default.copy()
+                    
+                    # 尝试解析 JSON
+                    data = json.loads(content)
+                    return data
+                    
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON 解析失败 (尝试 {attempt + 1}/{max_retries}): {file_path} - {e}")
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+            else:
+                logger.error(f"JSON 文件损坏，返回默认值: {file_path}")
+                return default.copy()
+                
+        except TimeoutError as e:
+            logger.error(f"获取文件锁超时 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)
+            else:
+                return default.copy()
+                
+        except Exception as e:
+            logger.error(f"读取文件失败 (尝试 {attempt + 1}/{max_retries}): {file_path} - {e}")
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+            else:
+                return default.copy()
+    
+    return default.copy()
+
+
+def safe_write_json(file_path: Path, data: Dict, max_retries: int = 3) -> bool:
+    """安全写入 JSON 文件（带重试和文件锁）"""
+    for attempt in range(max_retries):
+        try:
+            # 使用文件锁
+            with FileLock(file_path, timeout=5):
+                # 先写入临时文件
+                temp_path = file_path.with_suffix('.tmp')
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())  # 强制写入磁盘
+                
+                # 原子性替换
+                temp_path.replace(file_path)
+                return True
+                
+        except TimeoutError as e:
+            logger.error(f"获取文件锁超时 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                
+        except Exception as e:
+            logger.error(f"写入文件失败 (尝试 {attempt + 1}/{max_retries}): {file_path} - {e}")
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+    
+    return False
 
 
 # ==================== 工具类 ====================
@@ -110,17 +224,15 @@ class CommandCoordinator:
         # 包含服务器信息的回调
         if len(parts) >= 2:
             if action in ['status_srv', 'update_srv', 'restart_srv', 'monitor_srv']:
-                # 第二个参数是服务器名
                 target_server = parts[1]
                 should_handle = (target_server == self.server_name)
-                logger.info(f"回调目标服务器: {target_server}, 当前服务器: {self.server_name}, 处理: {should_handle}")
+                logger.info(f"回调目标: {target_server}, 当前: {self.server_name}, 处理: {should_handle}")
                 return should_handle
             
             if action in ['update_cnt', 'restart_cnt', 'confirm_restart', 'add_mon', 'rem_mon']:
-                # 第二个参数是服务器名
                 target_server = parts[1]
                 should_handle = (target_server == self.server_name)
-                logger.info(f"回调目标服务器: {target_server}, 当前服务器: {self.server_name}, 处理: {should_handle}")
+                logger.info(f"回调目标: {target_server}, 当前: {self.server_name}, 处理: {should_handle}")
                 return should_handle
         
         # 默认：让协调者处理
@@ -132,24 +244,19 @@ class CommandCoordinator:
 
     def _get_active_servers(self) -> List[str]:
         """获取活跃的服务器列表"""
-        if not self.registry_file.exists():
+        registry = safe_read_json(self.registry_file, default={})
+        
+        if not registry:
             return [self.server_name]
 
-        try:
-            with open(self.registry_file, 'r', encoding='utf-8') as f:
-                registry = json.load(f)
+        current_time = time.time()
+        active_servers = []
 
-            current_time = time.time()
-            active_servers = []
+        for server, info in registry.items():
+            if current_time - info.get('last_heartbeat', 0) < 90:
+                active_servers.append(server)
 
-            for server, info in registry.items():
-                if current_time - info.get('last_heartbeat', 0) < 90:
-                    active_servers.append(server)
-
-            return sorted(active_servers) if active_servers else [self.server_name]
-        except Exception as e:
-            logger.error(f"读取注册表失败: {e}")
-            return [self.server_name]
+        return sorted(active_servers) if active_servers else [self.server_name]
 
 
 class TelegramBot:
@@ -353,21 +460,11 @@ class ConfigManager:
 
     def _load_config(self) -> Dict:
         """加载配置"""
-        if self.config_file.exists():
-            try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.error(f"加载配置失败: {e}")
-        return {}
+        return safe_read_json(self.config_file, default={})
 
     def _save_config(self):
         """保存配置"""
-        try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"保存配置失败: {e}")
+        safe_write_json(self.config_file, self.config)
 
     def get_excluded_containers(self, server: Optional[str] = None) -> Set[str]:
         """获取排除的容器列表"""
@@ -410,24 +507,26 @@ class ServerRegistry:
 
     def register(self):
         """注册当前服务器"""
-        registry = self._load_registry()
+        registry = safe_read_json(self.registry_file, default={})
         registry[self.server_name] = {
             'last_heartbeat': time.time(),
             'version': VERSION
         }
-        self._save_registry(registry)
-        logger.info(f"服务器已注册: {self.server_name}")
+        if safe_write_json(self.registry_file, registry):
+            logger.info(f"服务器已注册: {self.server_name}")
+        else:
+            logger.error(f"服务器注册失败: {self.server_name}")
 
     def heartbeat(self):
         """发送心跳"""
-        registry = self._load_registry()
+        registry = safe_read_json(self.registry_file, default={})
         if self.server_name in registry:
             registry[self.server_name]['last_heartbeat'] = time.time()
-            self._save_registry(registry)
+            safe_write_json(self.registry_file, registry)
 
     def get_active_servers(self) -> List[str]:
         """获取活跃的服务器列表"""
-        registry = self._load_registry()
+        registry = safe_read_json(self.registry_file, default={})
         current_time = time.time()
         active_servers = []
 
@@ -436,24 +535,6 @@ class ServerRegistry:
                 active_servers.append(server)
 
         return sorted(active_servers)
-
-    def _load_registry(self) -> Dict:
-        """加载注册表"""
-        if self.registry_file.exists():
-            try:
-                with open(self.registry_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.error(f"加载注册表失败: {e}")
-        return {}
-
-    def _save_registry(self, registry: Dict):
-        """保存注册表"""
-        try:
-            with open(self.registry_file, 'w', encoding='utf-8') as f:
-                json.dump(registry, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"保存注册表失败: {e}")
 
 
 # ==================== 命令处理器 ====================
@@ -487,7 +568,6 @@ class CommandHandler:
 
     def _show_server_status(self, chat_id: str, server: str):
         """显示指定服务器的状态"""
-        # 只有目标服务器才执行
         if server != SERVER_NAME:
             logger.info(f"状态查询目标是 {server}，当前是 {SERVER_NAME}，跳过")
             return
@@ -549,7 +629,6 @@ class CommandHandler:
 
     def _show_update_containers(self, chat_id: str, server: str):
         """显示可更新的容器列表"""
-        # 只有目标服务器才执行
         if server != SERVER_NAME:
             logger.info(f"更新目标是 {server}，当前是 {SERVER_NAME}，跳过")
             return
@@ -593,7 +672,6 @@ class CommandHandler:
 
     def _show_restart_containers(self, chat_id: str, server: str):
         """显示可重启的容器列表"""
-        # 只有目标服务器才执行
         if server != SERVER_NAME:
             logger.info(f"重启目标是 {server}，当前是 {SERVER_NAME}，跳过")
             return
@@ -682,7 +760,6 @@ class CommandHandler:
                 return
 
             self.bot.answer_callback(callback_query_id, "正在准备更新...")
-            # TODO: 实现容器更新逻辑
             self.bot.edit_message(
                 chat_id, message_id,
                 f"⚠️ 容器更新功能开发中\n\n服务器: <code>{server}</code>\n容器: <code>{container}</code>"
@@ -832,7 +909,6 @@ class CommandHandler:
     def _handle_monitor_server(self, chat_id: str, message_id: str, 
                                action: str, server: str):
         """处理监控服务器选择"""
-        # 只有目标服务器才执行
         if server != SERVER_NAME:
             logger.info(f"监控管理目标是 {server}，当前是 {SERVER_NAME}，跳过")
             return
@@ -915,7 +991,6 @@ class BotPoller(threading.Thread):
                     chat_id = str(message.get('chat', {}).get('id', ''))
 
                     if text and chat_id == CHAT_ID:
-                        # 检查是否应该处理此命令
                         if self.coordinator.should_handle_command(text):
                             self._handle_command(text, chat_id)
                         else:
@@ -925,7 +1000,6 @@ class BotPoller(threading.Thread):
                     callback_query = update.get('callback_query', {})
                     if callback_query:
                         callback_data = callback_query.get('data', '')
-                        # 检查是否应该处理此回调
                         if self.coordinator.should_handle_command(None, callback_data):
                             self._handle_callback(callback_query)
                         else:
@@ -1265,6 +1339,10 @@ def main():
     registry = ServerRegistry(SERVER_REGISTRY, SERVER_NAME)
     coordinator = CommandCoordinator(SERVER_NAME, SERVER_REGISTRY)
 
+    # 等待一下，让其他服务器先注册
+    logger.info("等待 2 秒后注册服务器...")
+    time.sleep(2)
+    
     registry.register()
 
     handler = CommandHandler(bot, docker, config, registry)
@@ -1309,11 +1387,11 @@ def main():
    /monitor - 监控管理
    /help - 显示帮助
 
-💡 <b>修复内容 v5.2.0</b>
-   • 修复多服务器重复响应问题
-   • 修复回调处理逻辑
-   • 优化服务器选择流程
-   • 确保只有目标服务器响应操作
+💡 <b>修复内容 v5.2.1</b>
+   • 添加文件锁机制防止冲突
+   • 改进 JSON 读写安全性
+   • 增加重试机制
+   • 修复 NFS 同步问题
 
 ⏰ <b>启动时间</b>
    <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
