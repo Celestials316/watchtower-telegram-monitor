@@ -27,10 +27,10 @@ services:
         max-file: "3"
     healthcheck:
       test: ["CMD", "sh", "-c", "ps aux | grep -v grep | grep -q watchtower"]
-      interval: 30秒
-      timeout: 10秒
+      interval: 30s
+      timeout: 10s
       retries: 3
-      start_period: 10秒
+      start_period: 10s
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
 
@@ -55,17 +55,7 @@ services:
         max-size: "10m"
         max-file: "3"
     labels:
-      - "com.centurylinklabs.watchtower.enable=false"      
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    labels:
-      - "com.centurylinklabs.watchtower.enable=false"    # command:
-    #   - nginx
-    #   - mysql
-    #   - redis
+      - "com.centurylinklabs.watchtower.enable=false"
 
   watchtower-notifier:
     image: w254992/watchtower-telegram-monitor:latest
@@ -80,40 +70,17 @@ services:
       - monitor-data:/data
     environment:
       - TZ=Asia/Shanghai
-      # ============================================
-      # 必填配置 - 请替换为你的实际值
-      # ============================================
-      - BOT_TOKEN=your_bot_token_here
-      - CHAT_ID=your_chat_id_here
-      
-      # ============================================
-      # 可选配置
-      # ============================================
-      # 服务器名称（用于区分多台服务器的通知）
-      - SERVER_NAME=
-      
-      # 检查间隔（秒）
-      # 1800 = 30分钟, 3600 = 1小时, 21600 = 6小时
-      - POLL_INTERVAL=3600
-      
-      # 是否自动清理旧镜像 (true/false)
-      - CLEANUP=true
-      
-      # 是否启用自动回滚 (true/false)
-      - ENABLE_ROLLBACK=true
-      
-      # 监控的容器列表（留空表示监控所有）
-      - MONITORED_CONTAINERS=
-      
-      # ============================================
-      # 代理配置（国内服务器可选）
-      # ============================================
-      # 如果在中国大陆，需要配置代理访问 Telegram
-      # 取消下面的注释并替换为实际代理地址
+      - BOT_TOKEN=your_bot_token_here  # 必填：Telegram bot token
+      - CHAT_ID=your_chat_id_here  # 必填：Telegram chat ID
+      - SERVER_NAME=  # 可选：服务器名称（用于多服务器区分）
+      - POLL_INTERVAL=3600  # 可选：检查间隔（秒）
+      - CLEANUP=true  # 可选：是否自动清理旧镜像
+      - ENABLE_ROLLBACK=true  # 可选：是否启用自动回滚
+      - MONITORED_CONTAINERS=  # 可选：监控的容器列表（留空表示监控所有）
+      # 代理配置（可选，适用于中国大陆用户）
       # - HTTP_PROXY=http://127.0.0.1:7890
       # - HTTPS_PROXY=http://127.0.0.1:7890
       # - NO_PROXY=localhost,127.0.0.1
-      
     logging:
       driver: "json-file"
       options:
@@ -128,6 +95,5 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
 
-# 命名卷用于多服务器共享数据
 volumes:
   monitor-data:
