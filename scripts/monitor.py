@@ -102,27 +102,27 @@ class FileLock:
    def __init__(self, file_path: Path, timeout: int = 10):
        self.file_path = file_path
        self.timeout = timeout
-       self.lock_file = None
+       self.lock_path = Path(str(file_path) + '.lock')
+       self.acquired = False
 
    def __enter__(self):
-       lock_path = str(self.file_path) + '.lock'
-       self.lock_file = open(lock_path, 'a')
-
        start_time = time.time()
        while True:
            try:
-               fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+               fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+               with os.fdopen(fd, 'w', encoding='utf-8') as lock_file:
+                   lock_file.write(f'{os.getpid()}\n')
+               self.acquired = True
                return self
-           except IOError:
+           except FileExistsError:
                if time.time() - start_time > self.timeout:
                    raise TimeoutError(f"无法获取文件锁: {self.file_path}")
                time.sleep(0.1)
 
    def __exit__(self, exc_type, exc_val, exc_tb):
-       if self.lock_file:
+       if self.acquired:
            try:
-               fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
-               self.lock_file.close()
+               self.lock_path.unlink(missing_ok=True)
            except Exception as e:
                logger.error(f"释放文件锁失败: {e}")
 
@@ -169,7 +169,7 @@ def safe_write_json(file_path: Path, data: Dict, max_retries: int = 3) -> bool:
    for attempt in range(max_retries):
        try:
            with FileLock(file_path, timeout=5):
-               temp_path = file_path.with_suffix('.tmp')
+               temp_path = file_path.with_name(f'{file_path.name}.{uuid.uuid4().hex}.tmp')
                with open(temp_path, 'w', encoding='utf-8') as f:
                    json.dump(data, f, ensure_ascii=False, indent=2)
                    f.flush()
@@ -207,7 +207,7 @@ def safe_update_json(file_path: Path, updater: Callable[[Dict], Dict], default: 
                if updated is None:
                    updated = data
 
-               temp_path = file_path.with_suffix('.tmp')
+               temp_path = file_path.with_name(f'{file_path.name}.{uuid.uuid4().hex}.tmp')
                with open(temp_path, 'w', encoding='utf-8') as f:
                    json.dump(updated, f, ensure_ascii=False, indent=2)
                    f.flush()
