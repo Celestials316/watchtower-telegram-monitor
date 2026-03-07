@@ -1180,9 +1180,11 @@ class CommandHandler:
     def _send_or_edit(self, chat_id: str, text: str, reply_markup: Optional[Dict] = None,
                       message_id: Optional[str] = None):
         if message_id:
-            self.bot.edit_message(chat_id, message_id, text, reply_markup)
-        else:
-            self.bot.send_message(text, reply_markup)
+            edited = self.bot.edit_message(chat_id, message_id, text, reply_markup)
+            if edited:
+                return True
+            logger.warning('编辑消息失败，回退为发送新消息')
+        return self.bot.send_message(text, reply_markup)
 
     def handle_servers(self, chat_id: str):
         servers = self.registry.get_active_servers()
@@ -1506,11 +1508,9 @@ class CommandHandler:
             time.sleep(0.2)
 
             if action == 'status_srv':
-                self.bot.send_message(f'🖥️ 已选择服务器：<code>{escape_html(parts[1])}</code>')
-                self._show_server_status(chat_id, parts[1])
+                self._show_server_status(chat_id, parts[1], message_id)
             elif action == 'update_srv':
-                self.bot.send_message(f'🖥️ 已选择服务器：<code>{escape_html(parts[1])}</code>')
-                self._show_update_containers(chat_id, parts[1])
+                self._show_update_containers(chat_id, parts[1], message_id)
             elif action == 'update_cnt':
                 server, container = parts[1], parts[2]
                 confirm_msg = f"""⚠️ <b>确认更新</b>
@@ -1537,8 +1537,7 @@ class CommandHandler:
                 else:
                     self._enqueue_remote_action(action, server, container, chat_id, message_id)
             elif action == 'restart_srv':
-                self.bot.send_message(f'🖥️ 已选择服务器：<code>{escape_html(parts[1])}</code>')
-                self._show_restart_containers(chat_id, parts[1])
+                self._show_restart_containers(chat_id, parts[1], message_id)
             elif action == 'restart_cnt':
                 server, container = parts[1], parts[2]
                 confirm_msg = f"""⚠️ <b>确认重启</b>
