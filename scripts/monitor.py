@@ -327,6 +327,16 @@ class RemoteCommandQueue:
         safe_update_json(self.queue_file, updater, default={})
         return job_id
 
+    def count_pending(self, target_server: Optional[str] = None) -> int:
+        data = safe_read_json(self.queue_file, default={})
+        jobs = data.get('jobs', [])
+        if target_server is None:
+            return sum(1 for job in jobs if job.get('status') in {'pending', 'processing'})
+        return sum(
+            1 for job in jobs
+            if job.get('target_server') == target_server and job.get('status') in {'pending', 'processing'}
+        )
+
     def claim(self, target_server: str) -> Optional[Dict]:
         claimed = {}
 
@@ -1083,6 +1093,10 @@ class ServerRegistry:
         self.is_primary = is_primary
         self.heartbeat_interval = 30
         self.timeout = 120
+        self.current_mode = 'unknown'
+
+    def set_mode(self, mode: str):
+        self.current_mode = mode
 
     def register(self):
         all_containers = DockerManager.get_all_containers()
@@ -1094,7 +1108,8 @@ class ServerRegistry:
                 'last_heartbeat': time.time(),
                 'version': VERSION,
                 'is_primary': self.is_primary,
-                'container_count': len(monitored_containers)
+                'container_count': len(monitored_containers),
+                'mode': self.current_mode
             }
             return registry
 
@@ -1118,7 +1133,8 @@ class ServerRegistry:
                 'last_heartbeat': time.time(),
                 'version': VERSION,
                 'is_primary': self.is_primary,
-                'container_count': len(monitored_containers)
+                'container_count': len(monitored_containers),
+                'mode': self.current_mode
             }
             return registry
 
@@ -1170,6 +1186,10 @@ class CommandHandler:
 
     def _get_server_containers(self, server: str) -> List[str]:
         return sorted(self._get_server_snapshots(server).keys())
+
+    def _get_server_update_meta(self, server: str) -> Dict:
+        data = self._get_update_state()
+        return dict(data.get(server, {}))
 
     def _send_or_edit(self, chat_id: str, text: str, reply_markup: Optional[Dict] = None,
                       message_id: Optional[str] = None):
@@ -1230,6 +1250,13 @@ class CommandHandler:
         all_containers = sorted(snapshots.keys())
         monitored = [container for container in all_containers if self.config.is_monitored(container, server)]
         excluded = sorted(self.config.get_excluded_containers(server))
+        update_meta = self._get_server_update_meta(server)
+        registry_data = safe_read_json(self.registry.registry_file, default={})
+        server_registry = registry_data.get(server, {})
+        mode = server_registry.get('mode', 'unknown')
+        last_sync = update_meta.get('updated_at')
+        queue_count = self.command_queue.count_pending(server)
+        sync_text = datetime.fromtimestamp(last_sync).strftime('%Y-%m-%d %H:%M:%S') if last_sync else '未同步'
 
         status_msg = f"""📊 <b>服务器状态</b>
 
@@ -1238,6 +1265,9 @@ class CommandHandler:
   名称: <code>{escape_html(server)}</code>
   时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
   版本: <code>v{VERSION}</code>
+  模式: <code>{escape_html(mode)}</code>
+  同步: <code>{sync_text}</code>
+  队列: <code>{queue_count}</code>
 
 📦 <b>容器统计</b>
   总计: <code>{len(all_containers)}</code>
@@ -1460,13 +1490,17 @@ class CommandHandler:
             self._execute_restart(chat_id, message_id, server, container)
 
     def _enqueue_remote_action(self, action: str, server: str, container: str, chat_id: str, message_id: str):
-        self.command_queue.enqueue(server, action, {
+        job_id = self.command_queue.enqueue(server, action, {
             'server': server,
             'container': container,
             'chat_id': chat_id,
             'message_id': message_id
         })
         waiting = '⏳ 已提交远程更新任务...' if action == 'confirm_update' else '⏳ 已提交远程重启任务...'
+        waiting += f"\n\n🖥️ 目标服务器: <code>{escape_html(server)}</code>"
+        waiting += f"\n📦 容器: <code>{escape_html(container)}</code>"
+        waiting += f"\n🧾 任务号: <code>{escape_html(job_id)}</code>"
+        waiting += '\n\n请稍候，目标服务器开始执行后会继续回写此消息。'
         self.bot.edit_message(chat_id, message_id, waiting)
 
     def handle_callback(self, callback_data: str, callback_query_id: str,
@@ -1751,6 +1785,23 @@ class WatchtowerMonitor:
         self.session_data = {}
         self.state_store = UpdateStateManager(UPDATE_STATE_FILE, bot.server_name)
 
+    def _publish_local_inventory(self):
+        containers = sorted(self.docker.get_all_containers())
+        self.state_store.prune_containers(set(containers))
+        now = time.time()
+        for container in containers:
+            info = self.docker.get_container_info(container)
+            if not info:
+                continue
+            self.state_store.set_container_state(container, {
+                'image': info.get('image', 'unknown'),
+                'current_image_id': info.get('image_id', 'unknown'),
+                'current_version': self.docker._format_version_info(info, container),
+                'running': info.get('running'),
+                'health': info.get('health'),
+                'last_checked_at': now
+            })
+
     def _resolve_mode(self) -> str:
         if UPDATE_SOURCE == 'watchtower':
             return 'watchtower'
@@ -1761,6 +1812,7 @@ class WatchtowerMonitor:
     def start(self):
         mode = self._resolve_mode()
         logger.info(f'更新检测模式: {mode}')
+        self._publish_local_inventory()
         self.health.beat('update_monitor', status='starting', details={'mode': mode})
 
         if mode == 'watchtower':
@@ -2253,6 +2305,9 @@ def main():
     registry = ServerRegistry(SERVER_REGISTRY, SERVER_NAME, PRIMARY_SERVER)
     coordinator = CommandCoordinator(SERVER_NAME, PRIMARY_SERVER, SERVER_REGISTRY)
 
+    monitor = WatchtowerMonitor(bot, docker, config, health)
+    resolved_mode = monitor._resolve_mode()
+    registry.set_mode(resolved_mode)
     registry.register()
 
     if not PRIMARY_SERVER:
@@ -2260,8 +2315,6 @@ def main():
         time.sleep(0.5)
 
     handler = CommandHandler(bot, docker, config, registry)
-    monitor = WatchtowerMonitor(bot, docker, config, health)
-    resolved_mode = monitor._resolve_mode()
 
     if PRIMARY_SERVER:
         bot_poller = BotPoller(handler, bot, coordinator, health)
