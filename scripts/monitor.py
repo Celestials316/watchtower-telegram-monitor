@@ -1506,9 +1506,11 @@ class CommandHandler:
             time.sleep(0.2)
 
             if action == 'status_srv':
-                self._show_server_status(chat_id, parts[1], message_id)
+                self.bot.send_message(f'🖥️ 已选择服务器：<code>{escape_html(parts[1])}</code>')
+                self._show_server_status(chat_id, parts[1])
             elif action == 'update_srv':
-                self._show_update_containers(chat_id, parts[1], message_id)
+                self.bot.send_message(f'🖥️ 已选择服务器：<code>{escape_html(parts[1])}</code>')
+                self._show_update_containers(chat_id, parts[1])
             elif action == 'update_cnt':
                 server, container = parts[1], parts[2]
                 confirm_msg = f"""⚠️ <b>确认更新</b>
@@ -1535,7 +1537,8 @@ class CommandHandler:
                 else:
                     self._enqueue_remote_action(action, server, container, chat_id, message_id)
             elif action == 'restart_srv':
-                self._show_restart_containers(chat_id, parts[1], message_id)
+                self.bot.send_message(f'🖥️ 已选择服务器：<code>{escape_html(parts[1])}</code>')
+                self._show_restart_containers(chat_id, parts[1])
             elif action == 'restart_cnt':
                 server, container = parts[1], parts[2]
                 confirm_msg = f"""⚠️ <b>确认重启</b>
