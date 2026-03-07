@@ -401,25 +401,11 @@ class CommandCoordinator:
        parts = callback_data.split(':')
        action = parts[0]
 
-       non_server_callbacks = ['monitor_action', 'cancel']
-       if action in non_server_callbacks:
-           return self.is_primary
+       if self.is_primary:
+           return True
 
-       if len(parts) >= 2:
-           server_target_actions = [
-               'status_srv', 'update_srv', 'restart_srv', 'monitor_srv',
-               'update_cnt', 'restart_cnt', 'confirm_restart',
-               'confirm_update', 'add_mon', 'rem_mon'
-           ]
-
-           if action in server_target_actions:
-               target_server = parts[1]
-               should_handle = (target_server == self.server_name)
-               if not should_handle and action in ['confirm_restart', 'confirm_update']:
-                   logger.debug(f"跳过回调: {action} (目标: {target_server}, 当前: {self.server_name})")
-               return should_handle
-
-       return self.is_primary
+       logger.debug(f"从服务器忽略回调: {action} (仅主服务器处理 Bot 回调)")
+       return False
 
 class TelegramBot:
     def __init__(self, token: str, chat_id: str, server_name: str):
