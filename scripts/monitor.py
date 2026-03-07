@@ -1153,22 +1153,27 @@ class CommandHandler:
     def _get_update_state(self) -> Dict:
         return safe_read_json(UPDATE_STATE_FILE, default={})
 
-    def _get_server_snapshots(self, server: str) -> Dict[str, Dict]:
-        if self._is_local_server(server):
-            snapshots = {}
-            for container in self.docker.get_all_containers():
-                info = self.docker.get_container_info(container)
-                if info:
-                    snapshots[container] = {
-                        'current_version': self.docker._format_version_info(info, container),
-                        'running': info.get('running', False),
-                        'health': info.get('health'),
-                        'image': info.get('image', 'unknown')
-                    }
-            return snapshots
+    def _get_live_local_snapshots(self) -> Dict[str, Dict]:
+        snapshots = {}
+        for container in self.docker.get_all_containers():
+            info = self.docker.get_container_info(container)
+            if info:
+                snapshots[container] = {
+                    'current_version': self.docker._format_version_info(info, container),
+                    'running': info.get('running', False),
+                    'health': info.get('health'),
+                    'image': info.get('image', 'unknown')
+                }
+        return snapshots
 
+    def _get_server_snapshots(self, server: str) -> Dict[str, Dict]:
         data = self._get_update_state()
-        return dict(data.get(server, {}).get('containers', {}))
+        snapshots = dict(data.get(server, {}).get('containers', {}))
+        if snapshots:
+            return snapshots
+        if self._is_local_server(server):
+            return self._get_live_local_snapshots()
+        return {}
 
     def _get_server_containers(self, server: str) -> List[str]:
         return sorted(self._get_server_snapshots(server).keys())
@@ -1185,6 +1190,14 @@ class CommandHandler:
                 return True
             logger.warning('编辑消息失败，回退为发送新消息')
         return self.bot.send_message(text, reply_markup)
+
+    def _run_async(self, target, *args):
+        def runner():
+            try:
+                target(*args)
+            except Exception as e:
+                logger.exception(f'异步任务执行失败: {e}')
+        threading.Thread(target=runner, daemon=True).start()
 
     def handle_servers(self, chat_id: str):
         servers = self.registry.get_active_servers()
@@ -1508,9 +1521,11 @@ class CommandHandler:
             time.sleep(0.2)
 
             if action == 'status_srv':
-                self._show_server_status(chat_id, parts[1], message_id)
+                self.bot.answer_callback(callback_query_id, '正在加载服务器状态...') if callback_query_id else None
+                self._run_async(self._show_server_status, chat_id, parts[1], None)
             elif action == 'update_srv':
-                self._show_update_containers(chat_id, parts[1], message_id)
+                self.bot.answer_callback(callback_query_id, '正在加载可更新容器...') if callback_query_id else None
+                self._run_async(self._show_update_containers, chat_id, parts[1], None)
             elif action == 'update_cnt':
                 server, container = parts[1], parts[2]
                 confirm_msg = f"""⚠️ <b>确认更新</b>
@@ -1537,7 +1552,8 @@ class CommandHandler:
                 else:
                     self._enqueue_remote_action(action, server, container, chat_id, message_id)
             elif action == 'restart_srv':
-                self._show_restart_containers(chat_id, parts[1], message_id)
+                self.bot.answer_callback(callback_query_id, '正在加载可重启容器...') if callback_query_id else None
+                self._run_async(self._show_restart_containers, chat_id, parts[1], None)
             elif action == 'restart_cnt':
                 server, container = parts[1], parts[2]
                 confirm_msg = f"""⚠️ <b>确认重启</b>
