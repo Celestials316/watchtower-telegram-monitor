@@ -9,6 +9,7 @@ import subprocess
 import threading
 import logging
 import fcntl
+import hashlib
 import html as html_lib
 import re
 import select
@@ -49,8 +50,17 @@ def sanitize_file_component(value: str) -> str:
     if not value:
         return 'default'
 
-    cleaned = re.sub(r'[^A-Za-z0-9._-]+', '_', value).strip('._-')
-    return cleaned or 'default'
+    normalized = value.strip()
+    cleaned = re.sub(r'[^A-Za-z0-9._-]+', '_', normalized).strip('._-')
+    digest = hashlib.sha1(normalized.encode('utf-8')).hexdigest()[:10]
+
+    if not cleaned:
+        return f'server_{digest}'
+
+    if cleaned != normalized:
+        return f'{cleaned[:32]}_{digest}'
+
+    return cleaned[:48]
 
 
 def parse_container_list(value: str) -> Set[str]:
