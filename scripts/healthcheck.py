@@ -2,13 +2,34 @@
 
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 
-HEALTH_FILE = Path('/data/health_status.json')
 MAX_AGE = int(os.getenv('HEALTHCHECK_MAX_AGE', '120'))
-REQUIRED_COMPONENTS = ('main', 'bot_poller', 'heartbeat', 'watchtower_monitor')
+REQUIRED_COMPONENTS = ('main', 'bot_poller', 'heartbeat', 'update_monitor')
+
+
+def sanitize_file_component(value: str) -> str:
+    if not value:
+        return 'default'
+
+    cleaned = re.sub(r'[^A-Za-z0-9._-]+', '_', value).strip('._-')
+    return cleaned or 'default'
+
+
+def resolve_health_file() -> Path:
+    explicit_path = os.getenv('HEALTHCHECK_FILE', '').strip()
+    if explicit_path:
+        return Path(explicit_path)
+
+    server_name = os.getenv('SERVER_NAME', 'default')
+    server_key = sanitize_file_component(server_name)
+    return Path(f'/data/health_status.{server_key}.json')
+
+
+HEALTH_FILE = resolve_health_file()
 
 
 def fail(message: str) -> int:
@@ -21,7 +42,7 @@ def load_health() -> dict:
     for _ in range(3):
         try:
             if not HEALTH_FILE.exists():
-                raise FileNotFoundError('健康状态文件不存在')
+                raise FileNotFoundError(f'健康状态文件不存在: {HEALTH_FILE}')
             return json.loads(HEALTH_FILE.read_text(encoding='utf-8'))
         except Exception as exc:
             last_error = exc

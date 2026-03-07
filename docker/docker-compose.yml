@@ -1,50 +1,21 @@
 services:
-  watchtower:
-    image: containrrr/watchtower:latest
-    container_name: watchtower
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
-    environment:
-      - WATCHTOWER_NOTIFICATIONS=
-      - WATCHTOWER_NO_STARTUP_MESSAGE=true
-      - TZ=${TZ:-Asia/Shanghai}
-      - WATCHTOWER_CLEANUP=${CLEANUP:-true}
-      - WATCHTOWER_INCLUDE_RESTARTING=true
-      - WATCHTOWER_INCLUDE_STOPPED=false
-      - WATCHTOWER_NO_RESTART=false
-      - WATCHTOWER_TIMEOUT=10s
-      - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-1800}
-      - WATCHTOWER_DEBUG=false
-      - WATCHTOWER_LOG_LEVEL=info
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    healthcheck:
-      disable: true
-    labels:
-      - "com.centurylinklabs.watchtower.enable=false"
-
   watchtower-notifier:
     image: w254992/watchtower-telegram-monitor:latest
     container_name: watchtower-notifier
     restart: unless-stopped
     network_mode: host
-    depends_on:
-      watchtower:
-        condition: service_started
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./data:/data
     env_file: .env
     environment:
-      - SERVER_NAME=My_Server_Name
-      - PRIMARY_SERVER=false
+      - SERVER_NAME=${SERVER_NAME:-My_Server_Name}
+      - PRIMARY_SERVER=${PRIMARY_SERVER:-false}
+      - UPDATE_SOURCE=${UPDATE_SOURCE:-auto}
+      - AUTO_UPDATE=${AUTO_UPDATE:-true}
+      - NOTIFY_ON_AVAILABLE_UPDATE=${NOTIFY_ON_AVAILABLE_UPDATE:-true}
+      - INITIAL_CHECK_DELAY=${INITIAL_CHECK_DELAY:-15}
+      - UPDATE_RETRY_BACKOFF=${UPDATE_RETRY_BACKOFF:-1800}
     logging:
       driver: "json-file"
       options:

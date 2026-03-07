@@ -61,45 +61,11 @@ curl -o docker-compose.yml https://raw.githubusercontent.com/Celestials316/watch
 
 ```yaml
 services:
-  watchtower:
-    image: containrrr/watchtower:latest
-    container_name: watchtower
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
-    environment:
-      - WATCHTOWER_NOTIFICATIONS=
-      - WATCHTOWER_NO_STARTUP_MESSAGE=true
-      - TZ=${TZ:-Asia/Shanghai}
-      - WATCHTOWER_CLEANUP=${CLEANUP:-true}
-      - WATCHTOWER_INCLUDE_RESTARTING=true
-      - WATCHTOWER_INCLUDE_STOPPED=false
-      - WATCHTOWER_NO_RESTART=false
-      - WATCHTOWER_TIMEOUT=10s
-      - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-1800}
-      - WATCHTOWER_DEBUG=false
-      - WATCHTOWER_LOG_LEVEL=info
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    healthcheck:
-      disable: true
-    labels:
-      - "com.centurylinklabs.watchtower.enable=false"
-
   watchtower-notifier:
     image: w254992/watchtower-telegram-monitor:latest
     container_name: watchtower-notifier
     restart: unless-stopped
     network_mode: host
-    depends_on:
-      watchtower:
-        condition: service_started
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./data:/data
@@ -107,6 +73,11 @@ services:
     environment:
       - SERVER_NAME=${SERVER_NAME:-My_Server_Name}
       - PRIMARY_SERVER=${PRIMARY_SERVER:-false}
+      - UPDATE_SOURCE=${UPDATE_SOURCE:-auto}
+      - AUTO_UPDATE=${AUTO_UPDATE:-true}
+      - NOTIFY_ON_AVAILABLE_UPDATE=${NOTIFY_ON_AVAILABLE_UPDATE:-true}
+      - INITIAL_CHECK_DELAY=${INITIAL_CHECK_DELAY:-15}
+      - UPDATE_RETRY_BACKOFF=${UPDATE_RETRY_BACKOFF:-1800}
     logging:
       driver: "json-file"
       options:
@@ -130,19 +101,23 @@ cat > .env << 'EOF'
 BOT_TOKEN=你的_bot_token
 CHAT_ID=你的_chat_id
 
-# 服务器名称（可选）
+# 服务器信息
 SERVER_NAME=我的服务器
+PRIMARY_SERVER=false
 
-# 检查间隔（秒）
-POLL_INTERVAL=3600
-
-# 自动清理旧镜像
+# 更新检测设置
+POLL_INTERVAL=1800
+INITIAL_CHECK_DELAY=15
+UPDATE_RETRY_BACKOFF=1800
+UPDATE_SOURCE=auto
+AUTO_UPDATE=true
+NOTIFY_ON_AVAILABLE_UPDATE=true
 CLEANUP=true
-
-# 启用自动回滚
 ENABLE_ROLLBACK=true
+
 # 可选：固定监控名单，多个容器请用逗号分隔
 MONITORED_CONTAINERS=
+HEALTHCHECK_MAX_AGE=120
 EOF
 
 # 编辑配置
@@ -167,6 +142,8 @@ docker compose logs -f
 ### 步骤 5: 验证
 
 启动后 10-30 秒内应该收到 Telegram 启动通知。
+
+> 兼容说明：如果宿主机当前已有 `watchtower` 容器，或仍沿用旧版包含 `watchtower` 服务的部署文件，程序会自动切换为旧版日志监听模式，避免重复更新与重复通知。
 
 ```bash
 # 检查状态
@@ -303,45 +280,11 @@ sudo umount /mnt/test
 
 ```yaml
 services:
-  watchtower:
-    image: containrrr/watchtower:latest
-    container_name: watchtower
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
-    environment:
-      - WATCHTOWER_NOTIFICATIONS=
-      - WATCHTOWER_NO_STARTUP_MESSAGE=true
-      - TZ=${TZ:-Asia/Shanghai}
-      - WATCHTOWER_CLEANUP=${CLEANUP:-true}
-      - WATCHTOWER_INCLUDE_RESTARTING=true
-      - WATCHTOWER_INCLUDE_STOPPED=false
-      - WATCHTOWER_NO_RESTART=false
-      - WATCHTOWER_TIMEOUT=10s
-      - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-1800}
-      - WATCHTOWER_DEBUG=false
-      - WATCHTOWER_LOG_LEVEL=info
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    healthcheck:
-      disable: true
-    labels:
-      - "com.centurylinklabs.watchtower.enable=false"
-
   watchtower-notifier:
     image: w254992/watchtower-telegram-monitor:latest
     container_name: watchtower-notifier
     restart: unless-stopped
     network_mode: host
-    depends_on:
-      watchtower:
-        condition: service_started
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - nfs-data:/data
@@ -349,6 +292,11 @@ services:
     environment:
       - SERVER_NAME=${SERVER_NAME:-My_Server_Name}
       - PRIMARY_SERVER=${PRIMARY_SERVER:-false}
+      - UPDATE_SOURCE=${UPDATE_SOURCE:-auto}
+      - AUTO_UPDATE=${AUTO_UPDATE:-true}
+      - NOTIFY_ON_AVAILABLE_UPDATE=${NOTIFY_ON_AVAILABLE_UPDATE:-true}
+      - INITIAL_CHECK_DELAY=${INITIAL_CHECK_DELAY:-15}
+      - UPDATE_RETRY_BACKOFF=${UPDATE_RETRY_BACKOFF:-1800}
     logging:
       driver: "json-file"
       options:
@@ -376,45 +324,11 @@ volumes:
 
 ```yaml
 services:
-  watchtower:
-    image: containrrr/watchtower:latest
-    container_name: watchtower
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
-    environment:
-      - WATCHTOWER_NOTIFICATIONS=
-      - WATCHTOWER_NO_STARTUP_MESSAGE=true
-      - TZ=${TZ:-Asia/Shanghai}
-      - WATCHTOWER_CLEANUP=${CLEANUP:-true}
-      - WATCHTOWER_INCLUDE_RESTARTING=true
-      - WATCHTOWER_INCLUDE_STOPPED=false
-      - WATCHTOWER_NO_RESTART=false
-      - WATCHTOWER_TIMEOUT=10s
-      - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-1800}
-      - WATCHTOWER_DEBUG=false
-      - WATCHTOWER_LOG_LEVEL=info
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    healthcheck:
-      disable: true
-    labels:
-      - "com.centurylinklabs.watchtower.enable=false"
-
   watchtower-notifier:
     image: w254992/watchtower-telegram-monitor:latest
     container_name: watchtower-notifier
     restart: unless-stopped
     network_mode: host
-    depends_on:
-      watchtower:
-        condition: service_started
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - nfs-data:/data
@@ -422,6 +336,11 @@ services:
     environment:
       - SERVER_NAME=${SERVER_NAME:-My_Server_Name}
       - PRIMARY_SERVER=${PRIMARY_SERVER:-false}
+      - UPDATE_SOURCE=${UPDATE_SOURCE:-auto}
+      - AUTO_UPDATE=${AUTO_UPDATE:-true}
+      - NOTIFY_ON_AVAILABLE_UPDATE=${NOTIFY_ON_AVAILABLE_UPDATE:-true}
+      - INITIAL_CHECK_DELAY=${INITIAL_CHECK_DELAY:-15}
+      - UPDATE_RETRY_BACKOFF=${UPDATE_RETRY_BACKOFF:-1800}
     logging:
       driver: "json-file"
       options:
@@ -441,7 +360,7 @@ volumes:
     driver: local
     driver_opts:
       type: nfs
-      o: addr=100.64.1.10,rw,nfsvers=4  # 京东云的 Tailscale IP
+      o: addr=100.64.1.10,rw,nfsvers=4
       device: ":/srv/watchtower-shared"
 ```
 
@@ -746,10 +665,10 @@ docker exec watchtower-notifier ls -la /data
 # 应该看到：
 # server_registry.json
 # monitor_config.json
-# health_status.json
+# health_status.<server>.json
 
 # 查看服务器注册表
-docker exec watchtower-notifier sh -c "cat /data/server_registry.json && echo && cat /data/health_status.json"
+docker exec watchtower-notifier sh -c "cat /data/server_registry.json && echo && cat /data/update_state.json && echo && ls -la /data/health_status.*.json"
 
 # 应该看到所有服务器的心跳信息
 ```

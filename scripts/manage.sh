@@ -1,5 +1,5 @@
 #!/bin/bash
-# Watchtower 监控服务管理脚本
+# 容器更新监控管理脚本
 
 set -euo pipefail
 
@@ -65,12 +65,16 @@ compose() {
     fi
 }
 
+container_exists() {
+    docker ps -a --format '{{.Names}}' | grep -Fxq "$1"
+}
+
 show_menu() {
     clear
     cat << "MENU"
 ╔════════════════════════════════════════════════════╗
 ║                                                    ║
-║        Watchtower 监控服务管理菜单                 ║
+║          容器更新监控管理菜单                      ║
 ║                                                    ║
 ╚════════════════════════════════════════════════════╝
 MENU
@@ -84,7 +88,7 @@ MENU
     echo -e "${CYAN}[日志查看]${NC}"
     echo "  5) 查看所有日志"
     echo "  6) 查看通知服务日志"
-    echo "  7) 查看 Watchtower 日志"
+    echo "  7) 查看 Watchtower 日志（兼容旧模式）"
     echo ""
     echo -e "${CYAN}[维护操作]${NC}"
     echo "  8) 更新服务镜像"
@@ -102,15 +106,31 @@ MENU
 }
 
 print_monitor_mode() {
-    if [ -f "$ENV_FILE" ] && grep -q '^MONITORED_CONTAINERS=' "$ENV_FILE"; then
-        monitored=$(grep '^MONITORED_CONTAINERS=' "$ENV_FILE" | cut -d= -f2-)
-        if [ -n "$monitored" ]; then
-            echo "监控模式: 固定名单"
-            echo "固定名单: $monitored"
-            return
-        fi
+    update_source="auto"
+    auto_update="true"
+    monitored=""
+
+    if [ -f "$ENV_FILE" ]; then
+        update_source=$(grep '^UPDATE_SOURCE=' "$ENV_FILE" | cut -d= -f2- || echo auto)
+        auto_update=$(grep '^AUTO_UPDATE=' "$ENV_FILE" | cut -d= -f2- || echo true)
+        monitored=$(grep '^MONITORED_CONTAINERS=' "$ENV_FILE" | cut -d= -f2- || true)
     fi
-    echo "监控模式: 默认监控全部容器"
+
+    echo "更新来源: ${update_source:-auto}"
+    echo "自动更新: ${auto_update:-true}"
+
+    if [ -n "$monitored" ]; then
+        echo "监控模式: 固定名单"
+        echo "固定名单: $monitored"
+    else
+        echo "监控模式: 默认监控全部容器"
+    fi
+
+    if container_exists watchtower; then
+        echo "兼容模式: 检测到 watchtower，运行时将自动切换旧模式"
+    else
+        echo "兼容模式: 当前未检测到 watchtower，将使用独立检测模式"
+    fi
 }
 
 backup_files() {
@@ -122,15 +142,18 @@ backup_files() {
     [ -f "$SCRIPT_DIR/manage.sh" ] && cp "$SCRIPT_DIR/manage.sh" "$BACKUP_DIR/"
     [ -f "$DATA_DIR/monitor_config.json" ] && cp "$DATA_DIR/monitor_config.json" "$BACKUP_DIR/"
     [ -f "$DATA_DIR/server_registry.json" ] && cp "$DATA_DIR/server_registry.json" "$BACKUP_DIR/"
-    [ -f "$DATA_DIR/health_status.json" ] && cp "$DATA_DIR/health_status.json" "$BACKUP_DIR/"
+    [ -f "$DATA_DIR/update_state.json" ] && cp "$DATA_DIR/update_state.json" "$BACKUP_DIR/"
+    for file in "$DATA_DIR"/health_status.*.json; do
+        [ -f "$file" ] && cp "$file" "$BACKUP_DIR/"
+    done
     echo -e "${GREEN}✓ 配置已备份${NC}"
 }
 
 clean_state_files() {
-    echo -e "${YELLOW}[警告] 这将清理 monitor_config.json、server_registry.json、health_status.json${NC}"
+    echo -e "${YELLOW}[警告] 这将清理 monitor_config.json、server_registry.json、update_state.json 和 health_status.*.json${NC}"
     read -r -p "确认清理? (y/n): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        rm -f "$DATA_DIR/monitor_config.json" "$DATA_DIR/server_registry.json" "$DATA_DIR/health_status.json"
+        rm -f "$DATA_DIR/monitor_config.json" "$DATA_DIR/server_registry.json" "$DATA_DIR/update_state.json" "$DATA_DIR"/health_status.*.json
         echo -e "${GREEN}✓ 状态文件已清理${NC}"
     else
         echo "已取消"
@@ -147,7 +170,7 @@ show_config() {
 
     if [ -f "$ENV_FILE" ]; then
         echo "═══ 监控配置 ═══"
-        grep -E '^(SERVER_NAME|PRIMARY_SERVER|POLL_INTERVAL|CLEANUP|ENABLE_ROLLBACK|MONITORED_CONTAINERS)=' "$ENV_FILE" || true
+        grep -E '^(SERVER_NAME|PRIMARY_SERVER|POLL_INTERVAL|INITIAL_CHECK_DELAY|UPDATE_RETRY_BACKOFF|UPDATE_SOURCE|AUTO_UPDATE|NOTIFY_ON_AVAILABLE_UPDATE|CLEANUP|ENABLE_ROLLBACK|MONITORED_CONTAINERS|HEALTHCHECK_MAX_AGE)=' "$ENV_FILE" || true
         echo ""
         print_monitor_mode
         echo ""
@@ -157,7 +180,7 @@ show_config() {
     fi
 
     echo "═══ 状态文件 ═══"
-    for file in monitor_config.json server_registry.json health_status.json; do
+    for file in monitor_config.json server_registry.json update_state.json; do
         if [ -f "$DATA_DIR/$file" ]; then
             size=$(du -h "$DATA_DIR/$file" | cut -f1)
             echo "$file: $size"
@@ -165,6 +188,18 @@ show_config() {
             echo "$file: 未初始化"
         fi
     done
+
+    found_health=false
+    for file in "$DATA_DIR"/health_status.*.json; do
+        if [ -f "$file" ]; then
+            found_health=true
+            size=$(du -h "$file" | cut -f1)
+            echo "$(basename "$file"): $size"
+        fi
+    done
+    if [ "$found_health" = false ]; then
+        echo "health_status.*.json: 未初始化"
+    fi
 }
 
 edit_config() {
@@ -173,16 +208,9 @@ edit_config() {
     echo "2. 环境变量: $ENV_FILE"
     read -r -p "编辑 Compose 还是 .env? (c/e): " target
     case "$target" in
-        c|C)
-            ${EDITOR:-vi} "$COMPOSE_FILE"
-            ;;
-        e|E)
-            ${EDITOR:-vi} "$ENV_FILE"
-            ;;
-        *)
-            echo "已取消"
-            return
-            ;;
+        c|C) ${EDITOR:-vi} "$COMPOSE_FILE" ;;
+        e|E) ${EDITOR:-vi} "$ENV_FILE" ;;
+        *) echo "已取消"; return ;;
     esac
 
     echo ""
@@ -213,7 +241,10 @@ execute_action() {
             compose ps
             echo ""
             echo -e "${CYAN}健康状态:${NC}"
-            docker inspect --format='{{.Name}}: {{if .State.Health}}{{.State.Health.Status}}{{else}}N/A{{end}}' watchtower watchtower-notifier 2>/dev/null | sed 's#^/##' || echo "无健康检查信息"
+            docker inspect --format='{{.Name}}: {{if .State.Health}}{{.State.Health.Status}}{{else}}N/A{{end}}' watchtower-notifier 2>/dev/null | sed 's#^/##' || echo "无健康检查信息"
+            if container_exists watchtower; then
+                docker inspect --format='{{.Name}}: {{if .State.Health}}{{.State.Health.Status}}{{else}}N/A{{end}}' watchtower 2>/dev/null | sed 's#^/##' || true
+            fi
             ;;
         5)
             echo -e "${BLUE}[日志] 查看所有日志 (Ctrl+C 退出)${NC}"
@@ -226,9 +257,13 @@ execute_action() {
             compose logs -f watchtower-notifier
             ;;
         7)
-            echo -e "${BLUE}[日志] 查看 Watchtower 日志 (Ctrl+C 退出)${NC}"
-            echo ""
-            compose logs -f watchtower
+            if container_exists watchtower; then
+                echo -e "${BLUE}[日志] 查看 Watchtower 日志 (Ctrl+C 退出)${NC}"
+                echo ""
+                compose logs -f watchtower
+            else
+                echo -e "${YELLOW}当前部署未启用 watchtower${NC}"
+            fi
             ;;
         8)
             echo -e "${BLUE}[操作] 更新服务镜像...${NC}"
@@ -243,33 +278,33 @@ execute_action() {
             echo -e "${BLUE}[信息] 详细健康检查${NC}"
             echo ""
             echo "═══ 容器运行状态 ═══"
-            docker ps -a --filter "name=watchtower" --format "table {{.Names}}\t{{.Status}}\t{{.State}}"
+            docker ps -a --filter "name=watchtower-notifier" --format "table {{.Names}}\t{{.Status}}\t{{.State}}"
+            if container_exists watchtower; then
+                docker ps -a --filter "name=watchtower" --format "table {{.Names}}\t{{.Status}}\t{{.State}}"
+            fi
             echo ""
             echo "═══ 健康检查结果 ═══"
-            docker inspect --format='{{.Name}}: {{if .State.Health}}{{.State.Health.Status}}{{else}}N/A{{end}}' watchtower watchtower-notifier 2>/dev/null | sed 's#^/##'
+            docker inspect --format='{{.Name}}: {{if .State.Health}}{{.State.Health.Status}}{{else}}N/A{{end}}' watchtower-notifier 2>/dev/null | sed 's#^/##'
+            if container_exists watchtower; then
+                docker inspect --format='{{.Name}}: {{if .State.Health}}{{.State.Health.Status}}{{else}}N/A{{end}}' watchtower 2>/dev/null | sed 's#^/##'
+            fi
             echo ""
             echo "═══ 资源使用情况 ═══"
-            docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" watchtower watchtower-notifier
+            docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" watchtower-notifier $(container_exists watchtower && echo watchtower || true)
             echo ""
             echo "═══ 最近日志 (最后20行) ═══"
-            echo -e "${CYAN}Watchtower:${NC}"
-            docker logs --tail 20 watchtower 2>&1 | tail -10
-            echo ""
             echo -e "${CYAN}Notifier:${NC}"
             docker logs --tail 20 watchtower-notifier 2>&1 | tail -10
+            if container_exists watchtower; then
+                echo ""
+                echo -e "${CYAN}Watchtower:${NC}"
+                docker logs --tail 20 watchtower 2>&1 | tail -10
+            fi
             ;;
-        11)
-            backup_files
-            ;;
-        12)
-            clean_state_files
-            ;;
-        13)
-            show_config
-            ;;
-        14)
-            edit_config
-            ;;
+        11) backup_files ;;
+        12) clean_state_files ;;
+        13) show_config ;;
+        14) edit_config ;;
         0)
             echo "退出管理菜单"
             exit 0

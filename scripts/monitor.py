@@ -9,9 +9,12 @@ import subprocess
 import threading
 import logging
 import fcntl
+import html as html_lib
+import re
 import select
+import shlex
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 import requests
 from pathlib import Path
 
@@ -22,13 +25,32 @@ SERVER_NAME = os.getenv('SERVER_NAME')
 PRIMARY_SERVER = os.getenv('PRIMARY_SERVER', 'false').lower() == 'true'
 ENABLE_ROLLBACK = os.getenv('ENABLE_ROLLBACK', 'true').lower() == 'true'
 CLEANUP_OLD_IMAGES = os.getenv('CLEANUP', 'true').lower() == 'true'
+AUTO_UPDATE = os.getenv('AUTO_UPDATE', 'true').lower() == 'true'
+NOTIFY_ON_AVAILABLE_UPDATE = os.getenv('NOTIFY_ON_AVAILABLE_UPDATE', 'true').lower() == 'true'
+UPDATE_SOURCE = os.getenv('UPDATE_SOURCE', 'auto').strip().lower()
+CHECK_INTERVAL = max(int(os.getenv('POLL_INTERVAL', '1800') or '1800'), 30)
+INITIAL_CHECK_DELAY = max(int(os.getenv('INITIAL_CHECK_DELAY', '15') or '15'), 0)
+UPDATE_RETRY_BACKOFF = max(int(os.getenv('UPDATE_RETRY_BACKOFF', '1800') or '1800'), 60)
+
+if UPDATE_SOURCE not in {'auto', 'independent', 'watchtower'}:
+    UPDATE_SOURCE = 'independent'
 
 DATA_DIR = Path("/data")
 MONITOR_CONFIG = DATA_DIR / "monitor_config.json"
 SERVER_REGISTRY = DATA_DIR / "server_registry.json"
-HEALTH_FILE = DATA_DIR / "health_status.json"
+UPDATE_STATE_FILE = DATA_DIR / "update_state.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+LOCK_DIR = DATA_DIR / 'locks'
+LOCK_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def sanitize_file_component(value: str) -> str:
+    if not value:
+        return 'default'
+
+    cleaned = re.sub(r'[^A-Za-z0-9._-]+', '_', value).strip('._-')
+    return cleaned or 'default'
 
 
 def parse_container_list(value: str) -> Set[str]:
@@ -39,6 +61,20 @@ def parse_container_list(value: str) -> Set[str]:
     return {item.strip() for item in normalized.split() if item.strip()}
 
 
+def escape_html(value: Any) -> str:
+    return html_lib.escape(str(value), quote=False)
+
+
+def strip_html(value: str) -> str:
+    return html_lib.unescape(re.sub(r'<[^>]+>', '', value))
+
+
+def container_lock_path(container: str) -> Path:
+    return LOCK_DIR / f"container_action_{sanitize_file_component(container)}"
+
+
+SERVER_FILE_KEY = sanitize_file_component(SERVER_NAME or 'default')
+HEALTH_FILE = DATA_DIR / f"health_status.{SERVER_FILE_KEY}.json"
 STATIC_MONITORED_CONTAINERS = parse_container_list(os.getenv('MONITORED_CONTAINERS', ''))
 
 logging.basicConfig(
@@ -213,6 +249,42 @@ class HealthReporter:
     def fail(self, component: str, error: Exception):
         self.beat(component, status='error', details={'error': str(error)[:200]})
 
+class UpdateStateManager:
+    def __init__(self, state_file: Path, server_name: str):
+        self.state_file = state_file
+        self.server_name = server_name
+
+    def _get_server_state(self, data: Dict) -> Dict:
+        server_state = data.setdefault(self.server_name, {})
+        server_state.setdefault('containers', {})
+        server_state['updated_at'] = time.time()
+        return server_state
+
+    def get_container_state(self, container: str) -> Dict:
+        data = safe_read_json(self.state_file, default={})
+        server_state = data.get(self.server_name, {})
+        containers = server_state.get('containers', {})
+        return dict(containers.get(container, {}))
+
+    def set_container_state(self, container: str, state: Dict):
+        def updater(data: Dict) -> Dict:
+            server_state = self._get_server_state(data)
+            server_state['containers'][container] = state
+            return data
+
+        safe_update_json(self.state_file, updater, default={})
+
+    def prune_containers(self, active_containers: Set[str]):
+        def updater(data: Dict) -> Dict:
+            server_state = self._get_server_state(data)
+            containers = server_state.get('containers', {})
+            for name in list(containers.keys()):
+                if name not in active_containers:
+                    containers.pop(name, None)
+            return data
+
+        safe_update_json(self.state_file, updater, default={})
+
 class CommandCoordinator:
    def __init__(self, server_name: str, primary_server: bool, registry_file: Path):
        self.server_name = server_name
@@ -265,500 +337,600 @@ class CommandCoordinator:
        return self.is_primary
 
 class TelegramBot:
-   def __init__(self, token: str, chat_id: str, server_name: str):
-       self.api_url = f"https://api.telegram.org/bot{token}"
-       self.chat_id = chat_id
-       self.server_name = server_name
-       self.session = requests.Session()
-       self.session.headers.update({'Connection': 'keep-alive'})
-       self._last_edit = {}  # 记录上次编辑时间，避免频繁编辑
+    def __init__(self, token: str, chat_id: str, server_name: str):
+        self.api_url = f"https://api.telegram.org/bot{token}"
+        self.chat_id = chat_id
+        self.server_name = server_name
+        self.session = requests.Session()
+        self.session.headers.update({'Connection': 'keep-alive'})
+        self._last_edit = {}
 
-   def send_message(self, text: str, reply_markup: Optional[Dict] = None,
-                    max_retries: int = 3) -> bool:
-       for attempt in range(max_retries):
-           try:
-               payload = {
-                   'chat_id': self.chat_id,
-                   'text': text,
-                   'parse_mode': 'HTML'
-               }
-               if reply_markup:
-                   payload['reply_markup'] = json.dumps(reply_markup)
+    def _request(self, endpoint: str, payload: Dict, timeout: int = 30,
+                 max_retries: int = 3, allow_plain_fallback: bool = False) -> Dict:
+        current_payload = dict(payload)
 
-               response = self.session.post(
-                   f"{self.api_url}/sendMessage",
-                   json=payload,
-                   timeout=30
-               )
+        for attempt in range(max_retries):
+            try:
+                response = self.session.post(
+                    f"{self.api_url}/{endpoint}",
+                    json=current_payload,
+                    timeout=timeout
+                )
 
-               if response.status_code == 200 and response.json().get('ok'):
-                   return True
-               else:
-                   error_desc = response.json().get('description', '未知错误')
-                   logger.error(f"Telegram API 错误: {error_desc}")
+                try:
+                    data = response.json()
+                except Exception:
+                    data = {'ok': False, 'description': response.text[:200] or '未知错误'}
 
-           except Exception as e:
-               logger.error(f"发送失败: {e}")
+                if response.status_code == 200 and data.get('ok'):
+                    return {'ok': True, 'data': data}
 
-           if attempt < max_retries - 1:
-               wait_time = (attempt + 1) * 5
-               time.sleep(wait_time)
+                description = str(data.get('description', response.text[:200] or '未知错误'))
+                description_lower = description.lower()
 
-       return False
+                if allow_plain_fallback and current_payload.get('parse_mode') == 'HTML':
+                    if 'parse entities' in description_lower or "can\'t parse" in description_lower:
+                        logger.warning('Telegram HTML 解析失败，尝试纯文本回退发送')
+                        current_payload.pop('parse_mode', None)
+                        current_payload['text'] = strip_html(str(current_payload.get('text', '')))
+                        allow_plain_fallback = False
+                        continue
 
-   def edit_message(self, chat_id: str, message_id: str, text: str,
-                    reply_markup: Optional[Dict] = None, max_retries: int = 3) -> bool:
-       """编辑消息，添加防抖和重试机制"""
-       edit_key = f"{chat_id}:{message_id}"
+                if endpoint == 'editMessageText' and 'message is not modified' in description_lower:
+                    return {'ok': True, 'data': data}
 
-       # 防抖：距离上次编辑少于0.5秒则跳过
-       current_time = time.time()
-       if edit_key in self._last_edit:
-           if current_time - self._last_edit[edit_key] < 0.5:
-               logger.debug(f"跳过频繁编辑: {message_id}")
-               return False
+                if response.status_code == 429:
+                    retry_after = int(data.get('parameters', {}).get('retry_after', attempt + 1))
+                    logger.warning(f"Telegram 触发限流，{retry_after} 秒后重试")
+                    time.sleep(min(max(retry_after, 1), 60))
+                    continue
 
-       self._last_edit[edit_key] = current_time
+                logger.error(f"Telegram API 错误 [{endpoint}]: {description}")
 
-       for attempt in range(max_retries):
-           try:
-               payload = {
-                   'chat_id': chat_id,
-                   'message_id': message_id,
-                   'text': text,
-                   'parse_mode': 'HTML'
-               }
-               if reply_markup:
-                   payload['reply_markup'] = json.dumps(reply_markup)
+            except Exception as e:
+                logger.error(f"Telegram 请求失败 [{endpoint}]: {e}")
 
-               response = self.session.post(
-                   f"{self.api_url}/editMessageText",
-                   json=payload,
-                   timeout=30
-               )
+            if attempt < max_retries - 1:
+                time.sleep(min((attempt + 1) * 2, 10))
 
-               if response.status_code == 200:
-                   return True
-               else:
-                   error_desc = response.json().get('description', '未知错误')
-                   # 消息未变化不算错误
-                   if 'message is not modified' in error_desc.lower():
-                       return True
-                   logger.debug(f"编辑消息失败: {error_desc}")
+        return {'ok': False, 'data': {}}
 
-           except Exception as e:
-               logger.debug(f"编辑消息异常: {e}")
+    def send_message(self, text: str, reply_markup: Optional[Dict] = None,
+                     max_retries: int = 3) -> bool:
+        payload = {
+            'chat_id': self.chat_id,
+            'text': text,
+            'parse_mode': 'HTML'
+        }
+        if reply_markup:
+            payload['reply_markup'] = json.dumps(reply_markup)
 
-           if attempt < max_retries - 1:
-               time.sleep(1)
+        result = self._request(
+            'sendMessage',
+            payload,
+            timeout=30,
+            max_retries=max_retries,
+            allow_plain_fallback=True
+        )
+        return result.get('ok', False)
 
-       return False
+    def edit_message(self, chat_id: str, message_id: str, text: str,
+                     reply_markup: Optional[Dict] = None, max_retries: int = 3) -> bool:
+        edit_key = f"{chat_id}:{message_id}"
+        current_time = time.time()
+        if edit_key in self._last_edit and current_time - self._last_edit[edit_key] < 0.5:
+            logger.debug(f"跳过频繁编辑: {message_id}")
+            return False
 
-   def answer_callback(self, callback_query_id: str, text: str = "", show_alert: bool = False) -> bool:
-       """答复回调查询，立即返回响应给用户"""
-       try:
-           payload = {
-               'callback_query_id': callback_query_id,
-               'show_alert': show_alert
-           }
-           if text:
-               payload['text'] = text
+        self._last_edit[edit_key] = current_time
+        payload = {
+            'chat_id': chat_id,
+            'message_id': message_id,
+            'text': text,
+            'parse_mode': 'HTML'
+        }
+        if reply_markup:
+            payload['reply_markup'] = json.dumps(reply_markup)
 
-           response = self.session.post(
-               f"{self.api_url}/answerCallbackQuery",
-               json=payload,
-               timeout=10
-           )
-           return response.status_code == 200
-       except Exception as e:
-           logger.error(f"回应回调失败: {e}")
-           return False
+        result = self._request(
+            'editMessageText',
+            payload,
+            timeout=30,
+            max_retries=max_retries,
+            allow_plain_fallback=True
+        )
+        if result.get('ok'):
+            return True
 
-   def get_updates(self, offset: int = 0, timeout: int = 30) -> Optional[List]:
-       try:
-           response = self.session.post(
-               f"{self.api_url}/getUpdates",
-               json={'offset': offset, 'timeout': timeout},
-               timeout=timeout + 10
-           )
-           if response.status_code == 200:
-               data = response.json()
-               if data.get('ok'):
-                   return data.get('result', [])
-       except Exception as e:
-           logger.debug(f"获取更新失败: {e}")
-       return None
+        return False
+
+    def answer_callback(self, callback_query_id: str, text: str = '', show_alert: bool = False) -> bool:
+        payload = {
+            'callback_query_id': callback_query_id,
+            'show_alert': show_alert
+        }
+        if text:
+            payload['text'] = text
+
+        result = self._request('answerCallbackQuery', payload, timeout=10, max_retries=2)
+        return result.get('ok', False)
+
+    def get_updates(self, offset: int = 0, timeout: int = 30) -> Optional[List]:
+        payload = {'offset': offset, 'timeout': timeout}
+        result = self._request('getUpdates', payload, timeout=timeout + 10, max_retries=2)
+        if result.get('ok'):
+            return result['data'].get('result', [])
+        return None
 
 class DockerManager:
-   @staticmethod
-   def get_all_containers() -> List[str]:
-       try:
-           result = subprocess.run(
-               ['docker', 'ps', '--format', '{{.Names}}'],
-               capture_output=True, text=True, timeout=10
-           )
-           if result.returncode == 0:
-               containers = result.stdout.strip().split('\n')
-               return [c for c in containers
-                      if c and c not in ['watchtower', 'watchtower-notifier']]
-       except Exception as e:
-           logger.error(f"获取容器列表失败: {e}")
-       return []
+    @staticmethod
+    def _run(command: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
 
-   @staticmethod
-   def get_container_info(container: str) -> Dict:
-       try:
-           result = subprocess.run(
-               ['docker', 'inspect', container],
-               capture_output=True, text=True, timeout=10
-           )
-           if result.returncode == 0:
-               data = json.loads(result.stdout)
-               if data:
-                   info = data[0]
-                   return {
-                       'name': container,
-                       'running': info['State']['Running'],
-                       'image': info['Config']['Image'],
-                       'image_id': info['Image'],
-                       'created': info['Created']
-                   }
-       except Exception as e:
-           logger.error(f"获取容器 {container} 信息失败: {e}")
-       return {}
+    @staticmethod
+    def has_watchtower_deployment() -> bool:
+        try:
+            result = DockerManager._run(
+                ['docker', 'ps', '-a', '--format', '{{.Names}}	{{.Image}}'],
+                timeout=15
+            )
+            if result.returncode != 0:
+                return False
 
-   @staticmethod
-   def restart_container(container: str) -> bool:
-       try:
-           result = subprocess.run(
-               ['docker', 'restart', container],
-               capture_output=True, text=True, timeout=60
-           )
-           return result.returncode == 0
-       except Exception as e:
-           logger.error(f"重启容器 {container} 失败: {e}")
-           return False
+            for line in result.stdout.splitlines():
+                if not line.strip():
+                    continue
+                name, _, image = line.partition('	')
+                name = name.strip().lower()
+                image = image.strip().lower()
+                if name == 'watchtower' or image.startswith('containrrr/watchtower'):
+                    return True
+            return False
+        except Exception as e:
+            logger.debug(f'检测 watchtower 部署失败: {e}')
+            return False
 
-   @staticmethod
-   def update_container(container: str, progress_callback=None) -> Dict:
-       result = {
-           'success': False,
-           'message': '',
-           'old_version': '',
-           'new_version': ''
-       }
+    @staticmethod
+    def get_all_containers() -> List[str]:
+        try:
+            result = DockerManager._run(
+                ['docker', 'ps', '--format', '{{.Names}}'],
+                timeout=10
+            )
+            if result.returncode == 0:
+                containers = result.stdout.strip().split('\n')
+                return [
+                    container for container in containers
+                    if container and container not in ['watchtower', 'watchtower-notifier']
+                ]
+        except Exception as e:
+            logger.error(f'获取容器列表失败: {e}')
+        return []
 
-       backup_tag = None
+    @staticmethod
+    def get_container_inspect(container: str) -> Dict:
+        try:
+            result = DockerManager._run(['docker', 'inspect', container], timeout=10)
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                if data:
+                    return data[0]
+        except Exception as e:
+            logger.error(f'获取容器 {container} 详情失败: {e}')
+        return {}
 
-       def build_run_cmd(config: Dict, image_ref: str) -> List[str]:
-           host_config = config.get('HostConfig', {})
-           container_config = config.get('Config', {})
-           run_cmd = ['docker', 'run', '-d', '--name', container]
+    @staticmethod
+    def get_container_info(container: str) -> Dict:
+        info = DockerManager.get_container_inspect(container)
+        if info:
+            state = info.get('State', {})
+            return {
+                'name': container,
+                'running': state.get('Running', False),
+                'health': (state.get('Health') or {}).get('Status'),
+                'image': info.get('Config', {}).get('Image', 'unknown'),
+                'image_id': info.get('Image', 'unknown'),
+                'created': info.get('Created', '')
+            }
+        return {}
 
-           network_mode = host_config.get('NetworkMode', 'bridge')
-           if network_mode:
-               run_cmd.extend(['--network', network_mode])
+    @staticmethod
+    def get_image_id(image: str) -> str:
+        try:
+            result = DockerManager._run(
+                ['docker', 'inspect', '--format', '{{.Id}}', image],
+                timeout=15
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception as e:
+            logger.debug(f'获取镜像 {image} ID 失败: {e}')
+        return ''
 
-           restart_policy = host_config.get('RestartPolicy', {}) or {}
-           restart_name = restart_policy.get('Name')
-           if restart_name:
-               if restart_name == 'on-failure' and restart_policy.get('MaximumRetryCount'):
-                   run_cmd.extend(['--restart', f"{restart_name}:{restart_policy['MaximumRetryCount']}"])
-               else:
-                   run_cmd.extend(['--restart', restart_name])
+    @staticmethod
+    def pull_image(image: str, timeout: int = 300) -> Dict:
+        result = {
+            'success': False,
+            'image': image,
+            'image_id': '',
+            'message': ''
+        }
 
-           if host_config.get('Privileged'):
-               run_cmd.append('--privileged')
-           if host_config.get('ReadonlyRootfs'):
-               run_cmd.append('--read-only')
-           if host_config.get('ShmSize'):
-               run_cmd.extend(['--shm-size', str(host_config['ShmSize'])])
-           if host_config.get('NanoCpus'):
-               run_cmd.extend(['--cpus', str(host_config['NanoCpus'] / 1_000_000_000)])
-           if host_config.get('Memory'):
-               run_cmd.extend(['--memory', str(host_config['Memory'])])
-           if host_config.get('PidsLimit') and host_config.get('PidsLimit') > 0:
-               run_cmd.extend(['--pids-limit', str(host_config['PidsLimit'])])
+        try:
+            pull_result = DockerManager._run(['docker', 'pull', image], timeout=timeout)
+            if pull_result.returncode != 0:
+                result['message'] = (pull_result.stderr or pull_result.stdout or '拉取失败')[:300]
+                return result
 
-           if container_config.get('WorkingDir'):
-               run_cmd.extend(['-w', container_config['WorkingDir']])
-           if container_config.get('User'):
-               run_cmd.extend(['-u', container_config['User']])
-           if container_config.get('Hostname'):
-               run_cmd.extend(['--hostname', container_config['Hostname']])
+            result['image_id'] = DockerManager.get_image_id(image)
+            if not result['image_id']:
+                result['message'] = '拉取成功，但无法读取最新镜像 ID'
+                return result
 
-           for env in container_config.get('Env', []) or []:
-               run_cmd.extend(['-e', env])
+            result['success'] = True
+            return result
+        except subprocess.TimeoutExpired:
+            result['message'] = '拉取镜像超时'
+            return result
+        except Exception as e:
+            result['message'] = f'拉取镜像异常: {str(e)[:200]}'
+            return result
 
-           labels = container_config.get('Labels') or {}
-           for key, value in labels.items():
-               if key.startswith('com.docker.compose.'):
-                   continue
-               run_cmd.extend(['--label', key if value in (None, '') else f'{key}={value}'])
+    @staticmethod
+    def wait_container_ready(container: str, timeout: int = 90) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            info = DockerManager.get_container_inspect(container)
+            if not info:
+                time.sleep(2)
+                continue
 
-           log_config = host_config.get('LogConfig', {}) or {}
-           if log_config.get('Type'):
-               run_cmd.extend(['--log-driver', log_config['Type']])
-               for key, value in (log_config.get('Config') or {}).items():
-                   run_cmd.extend(['--log-opt', f'{key}={value}'])
+            state = info.get('State', {})
+            if not state.get('Running', False):
+                time.sleep(2)
+                continue
 
-           for extra_host in host_config.get('ExtraHosts') or []:
-               run_cmd.extend(['--add-host', extra_host])
-           for cap in host_config.get('CapAdd') or []:
-               run_cmd.extend(['--cap-add', cap])
-           for cap in host_config.get('CapDrop') or []:
-               run_cmd.extend(['--cap-drop', cap])
-           for dns in host_config.get('Dns') or []:
-               run_cmd.extend(['--dns', dns])
-           for dns_search in host_config.get('DnsSearch') or []:
-               run_cmd.extend(['--dns-search', dns_search])
+            health = state.get('Health')
+            if not health:
+                return True
 
-           for mount in config.get('Mounts', []) or []:
-               source = mount.get('Name') or mount.get('Source')
-               destination = mount.get('Destination')
-               if not source or not destination:
-                   continue
+            status = health.get('Status')
+            if status == 'healthy':
+                return True
+            if status == 'unhealthy':
+                return False
 
-               mount_spec = f'{source}:{destination}'
-               mode = mount.get('Mode') or ''
-               if mode:
-                   mount_spec += f':{mode}'
-               elif mount.get('RW') is False:
-                   mount_spec += ':ro'
-               run_cmd.extend(['-v', mount_spec])
+            time.sleep(2)
 
-           if network_mode != 'host':
-               port_bindings = host_config.get('PortBindings', {}) or {}
-               for container_port, host_configs in port_bindings.items():
-                   for host_cfg in host_configs or []:
-                       host_port = host_cfg.get('HostPort', '')
-                       if not host_port:
-                           continue
-                       host_ip = host_cfg.get('HostIp', '')
-                       mapping = ''
-                       if host_ip and host_ip != '0.0.0.0':
-                           mapping += f'{host_ip}:'
-                       mapping += f'{host_port}:{container_port}'
-                       run_cmd.extend(['-p', mapping])
+        return False
 
-           entrypoint = container_config.get('Entrypoint')
-           cmd_args = []
-           if isinstance(entrypoint, list) and entrypoint:
-               run_cmd.extend(['--entrypoint', entrypoint[0]])
-               cmd_args.extend(entrypoint[1:])
-           elif isinstance(entrypoint, str) and entrypoint:
-               run_cmd.extend(['--entrypoint', entrypoint])
+    @staticmethod
+    def restart_container(container: str) -> bool:
+        try:
+            result = DockerManager._run(['docker', 'restart', container], timeout=60)
+            if result.returncode != 0:
+                return False
+            return DockerManager.wait_container_ready(container, timeout=60)
+        except Exception as e:
+            logger.error(f'重启容器 {container} 失败: {e}')
+            return False
 
-           cmd = container_config.get('Cmd')
-           if isinstance(cmd, list):
-               cmd_args.extend(cmd)
-           elif isinstance(cmd, str) and cmd:
-               cmd_args.append(cmd)
+    @staticmethod
+    def update_container(container: str, progress_callback=None) -> Dict:
+        result = {
+            'success': False,
+            'message': '',
+            'old_version': '',
+            'new_version': '',
+            'busy': False
+        }
 
-           run_cmd.append(image_ref)
-           run_cmd.extend(cmd_args)
-           return run_cmd
+        try:
+            with FileLock(container_lock_path(container), timeout=1):
+                return DockerManager._update_container_internal(container, progress_callback)
+        except TimeoutError:
+            result['busy'] = True
+            result['message'] = '容器正在执行其他更新任务，请稍后再试'
+            return result
 
-       def rollback_container(config: Dict, reason: str) -> str:
-           if not ENABLE_ROLLBACK or not backup_tag:
-               return reason
+    @staticmethod
+    def _update_container_internal(container: str, progress_callback=None) -> Dict:
+        result = {
+            'success': False,
+            'message': '',
+            'old_version': '',
+            'new_version': ''
+        }
 
-           logger.warning(f'更新失败，准备自动回滚容器 {container}')
-           if progress_callback:
-               progress_callback('↩️ 更新失败，正在自动回滚...')
+        backup_tag = None
+        config = {}
+        old_image_id = ''
 
-           subprocess.run(['docker', 'rm', '-f', container], capture_output=True, text=True, timeout=30)
-           rollback_cmd = build_run_cmd(config, backup_tag)
-           rollback_result = subprocess.run(
-               rollback_cmd,
-               capture_output=True, text=True, timeout=60
-           )
+        def build_run_cmd(container_config: Dict, image_ref: str) -> List[str]:
+            host_config = container_config.get('HostConfig', {})
+            config_section = container_config.get('Config', {})
+            run_cmd = ['docker', 'run', '-d', '--name', container]
 
-           if rollback_result.returncode == 0:
-               return f'{reason}；已自动回滚到旧镜像'
+            network_mode = host_config.get('NetworkMode', 'bridge')
+            if network_mode:
+                run_cmd.extend(['--network', network_mode])
 
-           return f"{reason}；自动回滚失败: {(rollback_result.stderr or rollback_result.stdout)[:200]}"
+            restart_policy = host_config.get('RestartPolicy', {}) or {}
+            restart_name = restart_policy.get('Name')
+            if restart_name:
+                if restart_name == 'on-failure' and restart_policy.get('MaximumRetryCount'):
+                    run_cmd.extend(['--restart', f"{restart_name}:{restart_policy['MaximumRetryCount']}"])
+                else:
+                    run_cmd.extend(['--restart', restart_name])
 
-       try:
-           if progress_callback:
-               progress_callback('📋 正在获取容器信息...')
+            if host_config.get('Privileged'):
+                run_cmd.append('--privileged')
+            if host_config.get('ReadonlyRootfs'):
+                run_cmd.append('--read-only')
+            if host_config.get('ShmSize'):
+                run_cmd.extend(['--shm-size', str(host_config['ShmSize'])])
+            if host_config.get('NanoCpus'):
+                run_cmd.extend(['--cpus', str(host_config['NanoCpus'] / 1_000_000_000)])
+            if host_config.get('Memory'):
+                run_cmd.extend(['--memory', str(host_config['Memory'])])
+            if host_config.get('PidsLimit') and host_config.get('PidsLimit') > 0:
+                run_cmd.extend(['--pids-limit', str(host_config['PidsLimit'])])
 
-           old_info = DockerManager.get_container_info(container)
-           if not old_info:
-               result['message'] = '无法获取容器信息'
-               return result
+            if config_section.get('WorkingDir'):
+                run_cmd.extend(['-w', config_section['WorkingDir']])
+            if config_section.get('User'):
+                run_cmd.extend(['-u', config_section['User']])
+            if config_section.get('Hostname'):
+                run_cmd.extend(['--hostname', config_section['Hostname']])
 
-           inspect_result = subprocess.run(
-               ['docker', 'inspect', container],
-               capture_output=True, text=True, timeout=10
-           )
-           if inspect_result.returncode != 0:
-               result['message'] = '无法获取容器配置'
-               return result
+            for env in config_section.get('Env', []) or []:
+                run_cmd.extend(['-e', env])
 
-           config = json.loads(inspect_result.stdout)[0]
-           image = old_info['image']
-           old_image_id = old_info['image_id']
-           result['old_version'] = DockerManager._format_version_info(old_info, container)
+            labels = config_section.get('Labels') or {}
+            for key, value in labels.items():
+                if key.startswith('com.docker.compose.'):
+                    continue
+                run_cmd.extend(['--label', key if value in (None, '') else f'{key}={value}'])
 
-           if ENABLE_ROLLBACK:
-               safe_container = ''.join(
-                   ch if ch.isalnum() or ch in '._-' else '-'
-                   for ch in container.lower()
-               ).strip('-') or 'container'
-               backup_tag = f'watchtower-rollback/{safe_container}:{int(time.time())}'
-               backup_result = subprocess.run(
-                   ['docker', 'image', 'tag', old_image_id, backup_tag],
-                   capture_output=True, text=True, timeout=20
-               )
-               if backup_result.returncode != 0:
-                   logger.warning(f'创建回滚镜像标签失败: {(backup_result.stderr or backup_result.stdout)[:200]}')
-                   backup_tag = None
+            log_config = host_config.get('LogConfig', {}) or {}
+            if log_config.get('Type'):
+                run_cmd.extend(['--log-driver', log_config['Type']])
+                for key, value in (log_config.get('Config') or {}).items():
+                    run_cmd.extend(['--log-opt', f'{key}={value}'])
 
-           if progress_callback:
-               progress_callback(f'🔄 正在拉取镜像: {image}')
+            healthcheck = config_section.get('Healthcheck') or {}
+            test = healthcheck.get('Test') or []
+            if test:
+                if test[0] == 'CMD-SHELL' and len(test) > 1:
+                    run_cmd.extend(['--health-cmd', test[1]])
+                elif test[0] == 'CMD' and len(test) > 1:
+                    run_cmd.extend(['--health-cmd', ' '.join(shlex.quote(part) for part in test[1:])])
+                elif test[0] == 'NONE':
+                    run_cmd.extend(['--no-healthcheck'])
 
-           logger.info(f'拉取镜像: {image}')
-           pull_result = subprocess.run(
-               ['docker', 'pull', image],
-               capture_output=True, text=True, timeout=300
-           )
+                if healthcheck.get('Interval'):
+                    run_cmd.extend(['--health-interval', f"{max(int(healthcheck['Interval'] / 1_000_000_000), 1)}s"])
+                if healthcheck.get('Timeout'):
+                    run_cmd.extend(['--health-timeout', f"{max(int(healthcheck['Timeout'] / 1_000_000_000), 1)}s"])
+                if healthcheck.get('StartPeriod'):
+                    run_cmd.extend(['--health-start-period', f"{max(int(healthcheck['StartPeriod'] / 1_000_000_000), 1)}s"])
+                if healthcheck.get('Retries') is not None:
+                    run_cmd.extend(['--health-retries', str(healthcheck['Retries'])])
 
-           if pull_result.returncode != 0:
-               result['message'] = f"拉取镜像失败: {(pull_result.stderr or pull_result.stdout)[:200]}"
-               return result
+            for extra_host in host_config.get('ExtraHosts') or []:
+                run_cmd.extend(['--add-host', extra_host])
+            for cap in host_config.get('CapAdd') or []:
+                run_cmd.extend(['--cap-add', cap])
+            for cap in host_config.get('CapDrop') or []:
+                run_cmd.extend(['--cap-drop', cap])
+            for dns in host_config.get('Dns') or []:
+                run_cmd.extend(['--dns', dns])
+            for dns_search in host_config.get('DnsSearch') or []:
+                run_cmd.extend(['--dns-search', dns_search])
 
-           new_inspect = subprocess.run(
-               ['docker', 'inspect', '--format', '{{.Id}}', image],
-               capture_output=True, text=True, timeout=10
-           )
+            for mount in container_config.get('Mounts', []) or []:
+                source = mount.get('Name') or mount.get('Source')
+                destination = mount.get('Destination')
+                if not source or not destination:
+                    continue
 
-           if new_inspect.returncode == 0:
-               new_image_id = new_inspect.stdout.strip()
-               if new_image_id == old_image_id:
-                   result['message'] = '镜像已是最新版本，无需更新'
-                   result['success'] = True
-                   return result
+                mount_spec = f'{source}:{destination}'
+                mode = mount.get('Mode') or ''
+                if mode:
+                    mount_spec += f':{mode}'
+                elif mount.get('RW') is False:
+                    mount_spec += ':ro'
+                run_cmd.extend(['-v', mount_spec])
 
-           if progress_callback:
-               progress_callback('⏸️ 正在停止旧容器...')
+            if network_mode != 'host':
+                port_bindings = host_config.get('PortBindings', {}) or {}
+                for container_port, host_configs in port_bindings.items():
+                    for host_cfg in host_configs or []:
+                        host_port = host_cfg.get('HostPort', '')
+                        if not host_port:
+                            continue
+                        host_ip = host_cfg.get('HostIp', '')
+                        mapping = ''
+                        if host_ip and host_ip != '0.0.0.0':
+                            mapping += f'{host_ip}:'
+                        mapping += f'{host_port}:{container_port}'
+                        run_cmd.extend(['-p', mapping])
 
-           logger.info(f'停止容器: {container}')
-           stop_result = subprocess.run(
-               ['docker', 'stop', container],
-               capture_output=True, text=True, timeout=30
-           )
-           if stop_result.returncode != 0:
-               result['message'] = f"停止旧容器失败: {(stop_result.stderr or stop_result.stdout)[:200]}"
-               return result
+            entrypoint = config_section.get('Entrypoint')
+            cmd_args = []
+            if isinstance(entrypoint, list) and entrypoint:
+                run_cmd.extend(['--entrypoint', entrypoint[0]])
+                cmd_args.extend(entrypoint[1:])
+            elif isinstance(entrypoint, str) and entrypoint:
+                run_cmd.extend(['--entrypoint', entrypoint])
 
-           if progress_callback:
-               progress_callback('🗑️ 正在删除旧容器...')
+            cmd = config_section.get('Cmd')
+            if isinstance(cmd, list):
+                cmd_args.extend(cmd)
+            elif isinstance(cmd, str) and cmd:
+                cmd_args.append(cmd)
 
-           logger.info(f'删除容器: {container}')
-           rm_result = subprocess.run(
-               ['docker', 'rm', container],
-               capture_output=True, text=True, timeout=10
-           )
-           if rm_result.returncode != 0:
-               result['message'] = f"删除旧容器失败: {(rm_result.stderr or rm_result.stdout)[:200]}"
-               return result
+            run_cmd.append(image_ref)
+            run_cmd.extend(cmd_args)
+            return run_cmd
 
-           if progress_callback:
-               progress_callback('🚀 正在启动新容器...')
+        def rollback_container(reason: str) -> str:
+            if not ENABLE_ROLLBACK or not backup_tag:
+                return reason
 
-           logger.info(f'启动新容器: {container}')
-           run_cmd = build_run_cmd(config, image)
-           run_result = subprocess.run(
-               run_cmd,
-               capture_output=True, text=True, timeout=60
-           )
+            logger.warning(f'更新失败，准备自动回滚容器 {container}')
+            if progress_callback:
+                progress_callback('↩️ 更新失败，正在自动回滚...')
 
-           if run_result.returncode != 0:
-               result['message'] = rollback_container(
-                   config,
-                   f"启动新容器失败: {(run_result.stderr or run_result.stdout)[:200]}"
-               )
-               return result
+            DockerManager._run(['docker', 'rm', '-f', container], timeout=30)
+            rollback_cmd = build_run_cmd(config, backup_tag)
+            rollback_result = DockerManager._run(rollback_cmd, timeout=60)
+            if rollback_result.returncode == 0 and DockerManager.wait_container_ready(container, timeout=90):
+                return f'{reason}；已自动回滚到旧镜像'
 
-           time.sleep(5)
+            rollback_message = (rollback_result.stderr or rollback_result.stdout or '未知错误')[:200]
+            return f'{reason}；自动回滚失败: {rollback_message}'
 
-           new_info = DockerManager.get_container_info(container)
-           if new_info and new_info.get('running'):
-               result['new_version'] = DockerManager._format_version_info(new_info, container)
-               result['success'] = True
-               result['message'] = '容器更新成功'
-           else:
-               result['message'] = rollback_container(config, '容器启动失败，请检查日志')
+        try:
+            if progress_callback:
+                progress_callback('📋 正在获取容器信息...')
 
-           return result
+            old_info = DockerManager.get_container_info(container)
+            if not old_info:
+                result['message'] = '无法获取容器信息'
+                return result
 
-       except subprocess.TimeoutExpired:
-           result['message'] = rollback_container(config, '操作超时') if 'config' in locals() else '操作超时'
-           return result
-       except Exception as e:
-           result['message'] = rollback_container(config, f'更新失败: {str(e)[:200]}') if 'config' in locals() else f'更新失败: {str(e)[:200]}'
-           logger.error(f'更新容器 {container} 失败: {e}')
-           return result
-       finally:
-           if backup_tag and result.get('success'):
-               subprocess.run(
-                   ['docker', 'image', 'rm', backup_tag],
-                   capture_output=True, text=True, timeout=20
-               )
+            config = DockerManager.get_container_inspect(container)
+            if not config:
+                result['message'] = '无法获取容器配置'
+                return result
 
-           if result.get('success') and CLEANUP_OLD_IMAGES and 'old_image_id' in locals():
-               subprocess.run(
-                   ['docker', 'image', 'rm', old_image_id],
-                   capture_output=True, text=True, timeout=20
-               )
+            image = old_info['image']
+            old_image_id = old_info['image_id']
+            result['old_version'] = DockerManager._format_version_info(old_info, container)
 
-   @staticmethod
-   def _format_version_info(info: Dict, container: str) -> str:
-       image_id = info.get('image_id', 'unknown')
-       id_short = image_id.replace('sha256:', '')[:12]
+            if ENABLE_ROLLBACK:
+                safe_container = sanitize_file_component(container.lower())
+                backup_tag = f'watchtower-rollback/{safe_container}:{int(time.time())}'
+                backup_result = DockerManager._run(
+                    ['docker', 'image', 'tag', old_image_id, backup_tag],
+                    timeout=20
+                )
+                if backup_result.returncode != 0:
+                    logger.warning(f"创建回滚镜像标签失败: {(backup_result.stderr or backup_result.stdout)[:200]}")
+                    backup_tag = None
 
-       if 'danmu' in container.lower():
-           version = DockerManager.get_danmu_version(container)
-           if version:
-               return f"v{version} ({id_short})"
+            if progress_callback:
+                progress_callback(f'🔄 正在拉取镜像: {image}')
 
-       tag = info.get('image', 'unknown:latest').split(':')[-1]
-       return f"{tag} ({id_short})"
+            pull_result = DockerManager.pull_image(image)
+            if not pull_result['success']:
+                result['message'] = f"拉取镜像失败: {pull_result['message']}"
+                return result
 
-   @staticmethod
-   def get_danmu_version(container: str) -> Optional[str]:
-       if 'danmu' not in container.lower():
-           return None
+            new_image_id = pull_result['image_id']
+            if new_image_id == old_image_id:
+                result['success'] = True
+                result['new_version'] = result['old_version']
+                result['message'] = '镜像已是最新版本，无需更新'
+                return result
 
-       try:
-           for _ in range(30):
-               check = subprocess.run(
-                   ['docker', 'exec', container, 'test', '-f',
-                    '/app/danmu_api/configs/globals.js'],
-                   capture_output=True, timeout=5
-               )
-               if check.returncode == 0:
-                   break
-               time.sleep(1)
+            if progress_callback:
+                progress_callback('⏸️ 正在停止旧容器...')
 
-           result = subprocess.run(
-               ['docker', 'exec', container, 'cat',
-                '/app/danmu_api/configs/globals.js'],
-               capture_output=True, text=True, timeout=10
-           )
+            stop_result = DockerManager._run(['docker', 'stop', container], timeout=30)
+            if stop_result.returncode != 0:
+                result['message'] = f"停止旧容器失败: {(stop_result.stderr or stop_result.stdout)[:200]}"
+                return result
 
-           if result.returncode == 0:
-               for line in result.stdout.split('\n'):
-                   if 'VERSION:' in line:
-                       import re
-                       match = re.search(r"VERSION:\s*['\"]([^'\"]+)['\"]", line)
-                       if match:
-                           return match.group(1)
-       except Exception as e:
-           logger.debug(f"获取 danmu 版本失败: {e}")
+            if progress_callback:
+                progress_callback('🗑️ 正在删除旧容器...')
 
-       return None
+            rm_result = DockerManager._run(['docker', 'rm', container], timeout=10)
+            if rm_result.returncode != 0:
+                result['message'] = f"删除旧容器失败: {(rm_result.stderr or rm_result.stdout)[:200]}"
+                return result
+
+            if progress_callback:
+                progress_callback('🚀 正在启动新容器...')
+
+            run_cmd = build_run_cmd(config, image)
+            run_result = DockerManager._run(run_cmd, timeout=60)
+            if run_result.returncode != 0:
+                result['message'] = rollback_container(
+                    f"启动新容器失败: {(run_result.stderr or run_result.stdout)[:200]}"
+                )
+                return result
+
+            if DockerManager.wait_container_ready(container, timeout=90):
+                new_info = DockerManager.get_container_info(container)
+                result['new_version'] = DockerManager._format_version_info(new_info or {
+                    'image': image,
+                    'image_id': new_image_id
+                }, container)
+                result['success'] = True
+                result['message'] = '容器更新成功'
+            else:
+                result['message'] = rollback_container('容器启动失败，请检查日志')
+
+            return result
+
+        except subprocess.TimeoutExpired:
+            result['message'] = rollback_container('操作超时') if config else '操作超时'
+            return result
+        except Exception as e:
+            result['message'] = rollback_container(f'更新失败: {str(e)[:200]}') if config else f'更新失败: {str(e)[:200]}'
+            logger.error(f'更新容器 {container} 失败: {e}')
+            return result
+        finally:
+            if backup_tag and result.get('success'):
+                DockerManager._run(['docker', 'image', 'rm', backup_tag], timeout=20)
+
+            if result.get('success') and CLEANUP_OLD_IMAGES and old_image_id:
+                DockerManager._run(['docker', 'image', 'rm', old_image_id], timeout=20)
+
+    @staticmethod
+    def _format_version_info(info: Dict, container: str) -> str:
+        image_id = info.get('image_id', 'unknown')
+        id_short = image_id.replace('sha256:', '')[:12]
+
+        if 'danmu' in container.lower():
+            version = DockerManager.get_danmu_version(container)
+            if version:
+                return f"v{version} ({id_short})"
+
+        tag = info.get('image', 'unknown:latest').split(':')[-1]
+        return f"{tag} ({id_short})"
+
+    @staticmethod
+    def get_danmu_version(container: str) -> Optional[str]:
+        if 'danmu' not in container.lower():
+            return None
+
+        try:
+            for _ in range(30):
+                check = DockerManager._run(
+                    ['docker', 'exec', container, 'test', '-f', '/app/danmu_api/configs/globals.js'],
+                    timeout=5
+                )
+                if check.returncode == 0:
+                    break
+                time.sleep(1)
+
+            result = DockerManager._run(
+                ['docker', 'exec', container, 'cat', '/app/danmu_api/configs/globals.js'],
+                timeout=10
+            )
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'VERSION:' in line:
+                        match = re.search(r"VERSION:\s*['\"]([^'\"]+)['\"]", line)
+                        if match:
+                            return match.group(1)
+        except Exception as e:
+            logger.debug(f'获取 danmu 版本失败: {e}')
+
+        return None
 
 class ConfigManager:
     def __init__(self, config_file: Path, server_name: str):
@@ -1527,14 +1699,31 @@ class WatchtowerMonitor:
         self.config = config
         self.health = health_reporter
         self.session_data = {}
+        self.state_store = UpdateStateManager(UPDATE_STATE_FILE, bot.server_name)
+
+    def _resolve_mode(self) -> str:
+        if UPDATE_SOURCE == 'watchtower':
+            return 'watchtower'
+        if UPDATE_SOURCE == 'independent':
+            return 'independent'
+        return 'watchtower' if self.docker.has_watchtower_deployment() else 'independent'
 
     def start(self):
-        logger.info("开始监控 Watchtower 日志...")
-        self.health.beat('watchtower_monitor', status='starting')
-        self._wait_for_watchtower()
+        mode = self._resolve_mode()
+        logger.info(f'更新检测模式: {mode}')
+        self.health.beat('update_monitor', status='starting', details={'mode': mode})
+
+        if mode == 'watchtower':
+            self._start_watchtower_mode()
+        else:
+            self._start_independent_mode()
+
+    def _start_watchtower_mode(self):
+        logger.info('开始监控 Watchtower 日志...')
         process = None
 
         try:
+            self._wait_for_watchtower()
             process = subprocess.Popen(
                 ['docker', 'logs', '-f', '--tail', '0', 'watchtower'],
                 stdout=subprocess.PIPE,
@@ -1542,14 +1731,14 @@ class WatchtowerMonitor:
                 text=True,
                 bufsize=1
             )
-            self.health.beat('watchtower_monitor', details={'attached': True})
+            self.health.beat('update_monitor', details={'mode': 'watchtower', 'attached': True})
 
             while not shutdown_flag.is_set():
                 if process.stdout is None:
                     raise RuntimeError('Watchtower 日志流不可用')
 
                 ready, _, _ = select.select([process.stdout], [], [], 5)
-                self.health.beat('watchtower_monitor')
+                self.health.beat('update_monitor', details={'mode': 'watchtower'})
 
                 if not ready:
                     if process.poll() is not None:
@@ -1570,8 +1759,8 @@ class WatchtowerMonitor:
                 self._process_log_line(line)
 
         except Exception as e:
-            self.health.fail('watchtower_monitor', e)
-            logger.error(f"监控 Watchtower 日志失败: {e}")
+            self.health.fail('update_monitor', e)
+            logger.error(f'监控 Watchtower 日志失败: {e}')
             raise
         finally:
             if process and process.poll() is None:
@@ -1581,9 +1770,234 @@ class WatchtowerMonitor:
                 except subprocess.TimeoutExpired:
                     process.kill()
 
-    def _wait_for_watchtower(self):
-        logger.info("正在等待 Watchtower 容器启动...")
+    def _start_independent_mode(self):
+        logger.info('开始独立检查容器更新...')
+        if INITIAL_CHECK_DELAY > 0:
+            logger.info(f'首次检查延迟 {INITIAL_CHECK_DELAY} 秒')
+            for _ in range(INITIAL_CHECK_DELAY):
+                if shutdown_flag.is_set():
+                    return
+                time.sleep(1)
 
+        while not shutdown_flag.is_set():
+            cycle_started_at = time.time()
+            try:
+                self.health.beat('update_monitor', details={
+                    'mode': 'independent',
+                    'cycle_started_at': cycle_started_at,
+                    'interval': CHECK_INTERVAL
+                })
+                self._run_independent_check_cycle()
+                self.health.beat('update_monitor', details={
+                    'mode': 'independent',
+                    'cycle_started_at': cycle_started_at,
+                    'cycle_finished_at': time.time(),
+                    'interval': CHECK_INTERVAL
+                })
+            except Exception as e:
+                self.health.fail('update_monitor', e)
+                logger.exception(f'独立检查容器更新失败: {e}')
+
+            elapsed = time.time() - cycle_started_at
+            sleep_left = max(CHECK_INTERVAL - elapsed, 1)
+            while sleep_left > 0 and not shutdown_flag.is_set():
+                step = min(sleep_left, 1)
+                time.sleep(step)
+                sleep_left -= step
+
+    def _run_independent_check_cycle(self):
+        containers = sorted(
+            container for container in self.docker.get_all_containers()
+            if self.config.is_monitored(container)
+        )
+        self.state_store.prune_containers(set(containers))
+
+        for container in containers:
+            if shutdown_flag.is_set():
+                break
+            self._check_container_update(container)
+
+    def _format_remote_version(self, image: str, image_id: str) -> str:
+        image_short = image_id.replace('sha256:', '')[:12] if image_id else 'unknown'
+        tag = image.split(':')[-1] if ':' in image else 'latest'
+        return f'{tag} ({image_short})'
+
+    def _send_update_available_notification(self, container: str, image: str,
+                                            current_version: str, latest_version: str):
+        message = f'''<b>[{escape_html(self.bot.server_name)}]</b> 🆕 <b>发现可用更新</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器名称</b>
+  <code>{escape_html(container)}</code>
+
+🎯 <b>镜像信息</b>
+  <code>{escape_html(image)}</code>
+
+🔄 <b>版本变更</b>
+  当前: <code>{escape_html(current_version)}</code>
+  最新: <code>{escape_html(latest_version)}</code>
+
+⏰ <b>发现时间</b>
+  <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
+━━━━━━━━━━━━━━━━━━━━
+
+💡 当前为仅通知模式，可通过 /update 手动更新'''
+        self.bot.send_message(message)
+
+    def _send_update_failure_notification(self, container: str, image: str,
+                                          current_version: str, latest_version: str,
+                                          error_message: str):
+        message = f'''<b>[{escape_html(self.bot.server_name)}]</b> ❌ <b>自动更新失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器名称</b>
+  <code>{escape_html(container)}</code>
+
+🎯 <b>镜像信息</b>
+  <code>{escape_html(image)}</code>
+
+🔄 <b>版本变更</b>
+  当前: <code>{escape_html(current_version)}</code>
+  目标: <code>{escape_html(latest_version)}</code>
+
+❌ <b>错误信息</b>
+  {escape_html(error_message)}
+
+⏰ <b>时间</b>
+  <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
+━━━━━━━━━━━━━━━━━━━━'''
+        self.bot.send_message(message)
+
+    def _send_check_error_notification(self, container: str, image: str, error_message: str):
+        message = f'''<b>[{escape_html(self.bot.server_name)}]</b> ⚠️ <b>检查更新失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>容器名称</b>
+  <code>{escape_html(container)}</code>
+
+🎯 <b>镜像信息</b>
+  <code>{escape_html(image)}</code>
+
+❌ <b>错误信息</b>
+  {escape_html(error_message)}
+
+⏰ <b>时间</b>
+  <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
+━━━━━━━━━━━━━━━━━━━━'''
+        self.bot.send_message(message)
+
+    def _check_container_update(self, container: str):
+        current_info = self.docker.get_container_info(container)
+        if not current_info or not current_info.get('image') or not current_info.get('image_id'):
+            logger.warning(f'跳过容器 {container}，无法获取当前镜像信息')
+            return
+
+        now = time.time()
+        image = current_info['image']
+        current_image_id = current_info['image_id']
+        current_version = self.docker._format_version_info(current_info, container)
+        state = self.state_store.get_container_state(container)
+        new_state = dict(state)
+        new_state.update({
+            'image': image,
+            'current_image_id': current_image_id,
+            'current_version': current_version,
+            'last_checked_at': now
+        })
+
+        pull_result = self.docker.pull_image(image)
+        if not pull_result['success']:
+            error_signature = f"{image}:{pull_result['message']}"[:300]
+            if error_signature != state.get('last_error_signature'):
+                self._send_check_error_notification(container, image, pull_result['message'])
+                new_state['last_error_signature'] = error_signature
+                new_state['last_error_notified_at'] = now
+            self.state_store.set_container_state(container, new_state)
+            return
+
+        latest_image_id = pull_result['image_id']
+        latest_version = self._format_remote_version(image, latest_image_id)
+        new_state['last_error_signature'] = ''
+        new_state['latest_image_id'] = latest_image_id
+        new_state['latest_version'] = latest_version
+
+        if latest_image_id == current_image_id:
+            for key in [
+                'available_image_id',
+                'available_version',
+                'last_failed_target_image_id',
+                'last_failure_message',
+                'last_notified_failure_image_id'
+            ]:
+                new_state.pop(key, None)
+            self.state_store.set_container_state(container, new_state)
+            return
+
+        new_state['available_image_id'] = latest_image_id
+        new_state['available_version'] = latest_version
+
+        if not AUTO_UPDATE:
+            if NOTIFY_ON_AVAILABLE_UPDATE and latest_image_id != state.get('last_notified_available_image_id'):
+                self._send_update_available_notification(container, image, current_version, latest_version)
+                new_state['last_notified_available_image_id'] = latest_image_id
+                new_state['last_notified_available_at'] = now
+            self.state_store.set_container_state(container, new_state)
+            return
+
+        last_attempt_at = float(state.get('last_attempt_at', 0) or 0)
+        if latest_image_id == state.get('last_failed_target_image_id') and now - last_attempt_at < UPDATE_RETRY_BACKOFF:
+            self.state_store.set_container_state(container, new_state)
+            return
+
+        logger.info(f'检测到容器 {container} 存在新版本，开始自动更新')
+        new_state['last_attempt_at'] = now
+        new_state['last_attempt_target_image_id'] = latest_image_id
+        update_result = self.docker.update_container(container)
+
+        refreshed_info = self.docker.get_container_info(container)
+        if refreshed_info:
+            new_state['current_image_id'] = refreshed_info.get('image_id', current_image_id)
+            new_state['current_version'] = self.docker._format_version_info(refreshed_info, container)
+
+        if update_result.get('busy'):
+            logger.info(f'容器 {container} 正在被其他任务处理，本轮跳过自动更新')
+        elif update_result['success']:
+            if update_result['message'] != '镜像已是最新版本，无需更新':
+                self._send_update_notification(
+                    container,
+                    image.split(':')[0],
+                    update_result.get('old_version') or current_version,
+                    update_result.get('new_version') or latest_version,
+                    True
+                )
+            for key in [
+                'available_image_id',
+                'available_version',
+                'last_failed_target_image_id',
+                'last_failure_message',
+                'last_notified_failure_image_id'
+            ]:
+                new_state.pop(key, None)
+            new_state['last_success_image_id'] = latest_image_id
+            new_state['last_success_at'] = time.time()
+        else:
+            new_state['last_failed_target_image_id'] = latest_image_id
+            new_state['last_failure_message'] = update_result['message']
+            if latest_image_id != state.get('last_notified_failure_image_id'):
+                self._send_update_failure_notification(
+                    container,
+                    image,
+                    current_version,
+                    latest_version,
+                    update_result['message']
+                )
+                new_state['last_notified_failure_image_id'] = latest_image_id
+                new_state['last_failure_notified_at'] = time.time()
+
+        self.state_store.set_container_state(container, new_state)
+
+    def _wait_for_watchtower(self):
+        logger.info('正在等待 Watchtower 容器启动...')
         for _ in range(60):
             try:
                 result = subprocess.run(
@@ -1591,38 +2005,32 @@ class WatchtowerMonitor:
                     capture_output=True, text=True, timeout=5
                 )
                 if result.returncode == 0 and 'true' in result.stdout:
-                    logger.info("Watchtower 已启动")
+                    logger.info('Watchtower 已启动')
                     time.sleep(3)
                     return
             except Exception:
                 pass
             time.sleep(2)
-
-        logger.warning("Watchtower 启动超时，继续监控")
+        logger.warning('Watchtower 启动超时，继续监控')
 
     def _process_log_line(self, line: str):
         try:
             if 'Stopping /' in line:
                 container = self._extract_container_name(line, 'Stopping /')
                 if container and self.config.is_monitored(container):
-                    logger.info(f"→ 捕获到停止: {container}")
+                    logger.info(f'→ 捕获到停止: {container}')
                     self._store_old_state(container)
-
             elif 'Session done' in line:
-                import re
                 match = re.search(r'Updated=(\d+)', line)
                 if match:
                     updated = int(match.group(1))
-                    logger.info(f"→ Session 完成: Updated={updated}")
-
+                    logger.info(f'→ Session 完成: Updated={updated}')
                     if updated > 0 and self.session_data:
                         self._process_updates()
-
             elif 'level=error' in line.lower() or 'level=fatal' in line.lower():
                 self._process_error(line)
-
         except Exception as e:
-            logger.error(f"处理日志行失败: {e}")
+            logger.error(f'处理日志行失败: {e}')
 
     def _extract_container_name(self, line: str, prefix: str) -> Optional[str]:
         try:
@@ -1646,40 +2054,34 @@ class WatchtowerMonitor:
                     'image_id': info.get('image_id', 'unknown'),
                     'version': self.docker.get_danmu_version(container)
                 }
-                logger.info(f"  → 已暂存 {container} 的旧信息")
+                logger.info(f'  → 已暂存 {container} 的旧信息')
         except Exception as e:
-            logger.error(f"存储旧状态失败: {e}")
+            logger.error(f'存储旧状态失败: {e}')
 
     def _process_updates(self):
-        logger.info(f"→ 发现 {len(self.session_data)} 个更新，开始处理...")
-
+        logger.info(f'→ 发现 {len(self.session_data)} 个更新，开始处理...')
         for container, old_state in self.session_data.items():
             try:
                 if not self.config.is_monitored(container):
-                    logger.info(f"→ {container} 已被排除，跳过处理")
+                    logger.info(f'→ {container} 已被排除，跳过处理')
                     continue
-
-                logger.info(f"→ 处理容器: {container}")
+                logger.info(f'→ 处理容器: {container}')
                 time.sleep(5)
-
                 for _ in range(60):
                     info = self.docker.get_container_info(container)
                     if info.get('running'):
-                        logger.info("  → 容器已启动")
+                        logger.info('  → 容器已启动')
                         time.sleep(5)
                         break
                     time.sleep(1)
-
                 new_info = self.docker.get_container_info(container)
                 new_version = self.docker.get_danmu_version(container)
-
                 old_ver = self._format_version(old_state, container)
                 new_ver = self._format_version({
                     'image': new_info.get('image', 'unknown'),
                     'image_id': new_info.get('image_id', 'unknown'),
                     'version': new_version
                 }, container)
-
                 self._send_update_notification(
                     container,
                     new_info.get('image', 'unknown').split(':')[0],
@@ -1687,77 +2089,67 @@ class WatchtowerMonitor:
                     new_ver,
                     new_info.get('running', False)
                 )
-
             except Exception as e:
-                logger.error(f"处理容器 {container} 更新失败: {e}")
-
+                logger.error(f'处理容器 {container} 更新失败: {e}')
         self.session_data.clear()
-        logger.info("→ 所有更新处理完成")
+        logger.info('→ 所有更新处理完成')
 
     def _format_version(self, state: Dict, container: str) -> str:
         image_id = state.get('image_id', 'unknown')
         id_short = image_id.replace('sha256:', '')[:12]
-
         if 'danmu' in container.lower() and state.get('version'):
             return f"v{state['version']} ({id_short})"
-        else:
-            tag = state.get('image', 'unknown:latest').split(':')[-1]
-            return f"{tag} ({id_short})"
+        tag = state.get('image', 'unknown:latest').split(':')[-1]
+        return f'{tag} ({id_short})'
 
     def _send_update_notification(self, container: str, image: str,
                                   old_ver: str, new_ver: str, running: bool):
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
         if running:
-            message = f"""<b>[{self.bot.server_name}]</b> ✨ <b>容器更新成功</b>
+            message = f'''<b>[{escape_html(self.bot.server_name)}]</b> ✨ <b>容器更新成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📦 <b>容器名称</b>
-  <code>{container}</code>
+  <code>{escape_html(container)}</code>
 
 🎯 <b>镜像信息</b>
-  <code>{image}</code>
+  <code>{escape_html(image)}</code>
 
 🔄 <b>版本变更</b>
-  <code>{old_ver}</code>
+  <code>{escape_html(old_ver)}</code>
   ➜
-  <code>{new_ver}</code>
+  <code>{escape_html(new_ver)}</code>
 
 ⏰ <b>更新时间</b>
   <code>{current_time}</code>
 ━━━━━━━━━━━━━━━━━━━━
 
-✅ 容器已成功启动并运行正常"""
+✅ 容器已成功启动并运行正常'''
         else:
-            message = f"""<b>[{self.bot.server_name}]</b> ❌ <b>容器启动失败</b>
+            message = f'''<b>[{escape_html(self.bot.server_name)}]</b> ❌ <b>容器启动失败</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📦 <b>容器名称</b>
-  <code>{container}</code>
+  <code>{escape_html(container)}</code>
 
 🎯 <b>镜像信息</b>
-  <code>{image}</code>
+  <code>{escape_html(image)}</code>
 
 🔄 <b>版本变更</b>
-  旧: <code>{old_ver}</code>
-  新: <code>{new_ver}</code>
+  旧: <code>{escape_html(old_ver)}</code>
+  新: <code>{escape_html(new_ver)}</code>
 
 ⏰ <b>更新时间</b>
   <code>{current_time}</code>
 ━━━━━━━━━━━━━━━━━━━━
 
 ⚠️ 更新后无法启动
-💡 检查: <code>docker logs {container}</code>"""
-
-        logger.info("  → 发送通知...")
+💡 检查: <code>docker logs {escape_html(container)}</code>'''
         self.bot.send_message(message)
 
     def _process_error(self, line: str):
-        if any(keyword in line.lower() for keyword in
-               ['skipping', 'already up to date', 'no new images',
-                'connection refused', 'timeout']):
+        if any(keyword in line.lower() for keyword in ['skipping', 'already up to date', 'no new images', 'connection refused', 'timeout']):
             return
-
         container = None
         for pattern in ['container=', 'container:', 'container ']:
             if pattern in line.lower():
@@ -1770,17 +2162,15 @@ class WatchtowerMonitor:
                     break
                 except Exception:
                     pass
-
-        if container and container not in ['watchtower', 'watchtower-notifier']:
-            if self.config.is_monitored(container):
-                error_msg = line[:200]
-                self.bot.send_message(f"""<b>[{self.bot.server_name}]</b> ⚠️ <b>Watchtower 严重错误</b>
+        if container and container not in ['watchtower', 'watchtower-notifier'] and self.config.is_monitored(container):
+            error_msg = line[:200]
+            self.bot.send_message(f'''<b>[{escape_html(self.bot.server_name)}]</b> ⚠️ <b>Watchtower 严重错误</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-📦 <b>容器</b>: <code>{container}</code>
-🔴 <b>错误</b>: <code>{error_msg}</code>
+📦 <b>容器</b>: <code>{escape_html(container)}</code>
+🔴 <b>错误</b>: <code>{escape_html(error_msg)}</code>
 🕐 <b>时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
-━━━━━━━━━━━━━━━━━━━━""")
+━━━━━━━━━━━━━━━━━━━━''')
 
 def main():
     if not SERVER_NAME:
@@ -1816,14 +2206,14 @@ def main():
         time.sleep(0.5)
 
     handler = CommandHandler(bot, docker, config, registry)
+    monitor = WatchtowerMonitor(bot, docker, config, health)
+    resolved_mode = monitor._resolve_mode()
 
     bot_poller = BotPoller(handler, bot, coordinator, health)
     bot_poller.start()
-    logger.info("Bot 轮询线程已启动")
 
     heartbeat = HeartbeatThread(registry, health)
     heartbeat.start()
-    logger.info("心跳线程已启动")
 
     all_containers = docker.get_all_containers()
     monitored = [c for c in all_containers if config.is_monitored(c)]
@@ -1851,6 +2241,7 @@ def main():
    版本: <code>v{VERSION}</code>
    主服务器: <code>{primary_server}</code> 🌟
    当前服务器: <code>{SERVER_NAME}</code>
+   更新模式: <code>{resolved_mode}</code>
    语言: <code>Python {sys.version.split()[0]}</code>
 
 🎯 <b>监控状态</b>
@@ -1870,9 +2261,9 @@ def main():
    /help - 显示帮助
 
 💡 <b>本版重点</b>
-   • 健康检查改为内部心跳机制
-   • 修复多服务器配置热加载问题
-   • 修复主服务器标记显示问题
+   • 默认使用独立更新检测模式
+   • 检测到 watchtower 时自动兼容旧模式
+   • 仅在真正有变化时发送通知
 
 ⏰ <b>启动时间</b>
    <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
@@ -1893,7 +2284,6 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    monitor = WatchtowerMonitor(bot, docker, config, health)
     exit_code = 0
 
     try:

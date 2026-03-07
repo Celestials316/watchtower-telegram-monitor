@@ -4,16 +4,17 @@
 [![Docker Image Size](https://img.shields.io/docker/image-size/w254992/watchtower-telegram-monitor)](https://hub.docker.com/r/w254992/watchtower-telegram-monitor)
 [![GitHub Stars](https://img.shields.io/github/stars/Celestials316/watchtower-telegram-monitor?style=social)](https://github.com/Celestials316/watchtower-telegram-monitor)
 
-自动监控 Docker 容器更新并通过 Telegram 发送中文通知，支持多服务器统一管理。
+独立监控 Docker 容器更新并通过 Telegram 发送中文通知，默认不依赖 watchtower；检测到现有 watchtower 部署时会自动兼容旧模式，避免冲突。
 
 ## ✨ 核心特性
 
-- 🔔 **实时通知** - 容器更新/失败即时推送 Telegram
+- 🛰️ **独立检测** - 默认由自身定期检查镜像更新，不再强依赖 watchtower
+- 🔁 **自动兼容旧模式** - 检测到现有 watchtower 部署时自动切回旧版日志监控模式
+- 🔔 **精准通知** - 仅在真正发现新版本、更新成功或更新失败时通知，避免重复刷屏
 - 🌐 **多服务器管理** - 一个 Bot 统一管理多台服务器
 - 🤖 **交互式命令** - 通过 Telegram 直接查询和管理
-- 📊 **版本追踪** - 自动记录镜像版本变化历史
 - 🔄 **自动回滚** - 更新失败自动恢复旧版本
-- 💾 **状态持久化** - 数据库记录，重启不丢失
+- 💾 **状态持久化** - 共享状态文件记录检查结果、失败重试和通知去重
 - 🎯 **灵活监控** - 支持全部或指定容器监控
 
 ## 📸 效果预览
@@ -73,7 +74,11 @@ cat > .env << 'EOF'
 BOT_TOKEN=你的_bot_token
 CHAT_ID=你的_chat_id
 SERVER_NAME=我的服务器
-POLL_INTERVAL=3600
+PRIMARY_SERVER=false
+POLL_INTERVAL=1800
+UPDATE_SOURCE=auto
+AUTO_UPDATE=true
+ENABLE_ROLLBACK=true
 EOF
 
 nano .env  # 修改配置
@@ -189,8 +194,14 @@ volumes:
 | `BOT_TOKEN` | Telegram Bot Token | - | ✅ |
 | `CHAT_ID` | Telegram Chat ID | - | ✅ |
 | `SERVER_NAME` | 服务器标识（多服务器时建议设置） | 空 | ❌ |
-| `POLL_INTERVAL` | 检查间隔（秒） | 3600 | ❌ |
-| `CLEANUP` | 自动清理旧镜像 | true | ❌ |
+| `PRIMARY_SERVER` | 是否主服务器 | false | ❌ |
+| `POLL_INTERVAL` | 检查间隔（秒） | 1800 | ❌ |
+| `INITIAL_CHECK_DELAY` | 启动后首次检查延迟（秒） | 15 | ❌ |
+| `UPDATE_SOURCE` | 更新来源模式：`auto`/`independent`/`watchtower` | auto | ❌ |
+| `AUTO_UPDATE` | 发现更新后是否自动更新容器 | true | ❌ |
+| `NOTIFY_ON_AVAILABLE_UPDATE` | 仅通知模式下是否发送“发现更新”通知 | true | ❌ |
+| `UPDATE_RETRY_BACKOFF` | 自动更新失败后的重试退避（秒） | 1800 | ❌ |
+| `CLEANUP` | 自动更新成功后清理旧镜像 | true | ❌ |
 | `ENABLE_ROLLBACK` | 更新失败时自动回滚 | true | ❌ |
 | `MONITORED_CONTAINERS` | 固定监控名单，逗号或空格分隔 | 空 | ❌ |
 | `HEALTHCHECK_MAX_AGE` | 健康检查允许的最大心跳延迟（秒） | 120 | ❌ |
@@ -242,19 +253,16 @@ docker compose down
 
 ```
 ┌─────────────────┐
-│   Watchtower    │ ← 定期检查容器更新
+│  更新检测调度器   │ ← 定期拉取镜像并比较当前容器镜像 ID
 └────────┬────────┘
          │
-         ↓
-┌─────────────────┐
-│  监控通知服务    │ ← 监听日志 + 处理命令
-└────────┬────────┘
-         │
-         ├─→ 发送 Telegram 通知
-         ├─→ 处理交互命令
-         ├─→ 记录共享状态文件
-         └─→ 多服务器心跳同步
+         ├─→ 发现新版本后按策略自动更新或仅通知
+         ├─→ 失败时自动回滚到旧镜像
+         ├─→ 记录 update_state / server_registry / health_status
+         └─→ 通过 Telegram 发送去重后的状态通知
 ```
+
+如宿主机已存在 `watchtower`，程序会自动切换到旧版兼容模式，继续监听 `watchtower` 日志，不会与现有部署冲突。
 
 ## 🐛 故障排查
 
@@ -295,8 +303,8 @@ showmount -e NFS服务器IP
 # 检查挂载
 docker exec watchtower-notifier ls -la /data
 
-# 查看心跳文件
-docker exec watchtower-notifier sh -c "cat /data/server_registry.json && echo && cat /data/health_status.json"
+# 查看共享状态文件
+docker exec watchtower-notifier sh -c "cat /data/server_registry.json && echo && cat /data/update_state.json && echo && ls -la /data/health_status.*.json"
 ```
 
 更多问题见 [故障排查文档](docs/INSTALL.md#故障排查)
@@ -304,11 +312,11 @@ docker exec watchtower-notifier sh -c "cat /data/server_registry.json && echo &&
 ## 🔄 更新日志
 
 ### v5.3.3 (2026-03-07)
-- ✨ 健康检查改为内部心跳机制，修复 `watchtower` 与 `watchtower-notifier` 误报 `unhealthy`
-- 🛡️ 修复多服务器配置与注册表并发写入问题，增强共享状态文件可靠性
-- 🔄 手动更新支持失败自动回滚，并在成功后定向清理旧镜像残留
-- 🎯 新增 `MONITORED_CONTAINERS` 固定监控名单与 `HEALTHCHECK_MAX_AGE` 配置项
-- 🧰 重构 `scripts/manage.sh`，修正部署路径、状态文件和配置展示逻辑
+- 🚀 默认切换为独立更新检测模式，不再强依赖 watchtower，检测到旧部署时自动兼容旧模式
+- 🔕 新增更新状态持久化与去重逻辑，解决“无更新也通知”和“每次检查都重复通知”问题
+- 🛡️ 修复多服务器配置、注册表和健康文件并发/覆盖问题，按服务器拆分健康状态文件
+- 🔄 自动更新支持失败回滚、失败退避重试与成功后清理旧镜像残留
+- 🎯 新增 `AUTO_UPDATE`、`UPDATE_SOURCE`、`UPDATE_RETRY_BACKOFF`、`INITIAL_CHECK_DELAY` 等配置项
 - 📝 同步更新 README 与安装文档中的推荐 `yml`、命令说明和排障示例
 
 ### v3.5.0 (2025-11-06)
