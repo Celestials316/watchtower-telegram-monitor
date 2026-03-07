@@ -1517,15 +1517,13 @@ class CommandHandler:
             action = parts[0]
             logger.info(f'处理回调: {callback_data}')
             if callback_query_id:
-                self.bot.answer_callback(callback_query_id, '')
+                self.bot.answer_callback(callback_query_id, '处理中...')
             time.sleep(0.2)
 
             if action == 'status_srv':
-                self.bot.answer_callback(callback_query_id, '正在加载服务器状态...') if callback_query_id else None
-                self._run_async(self._show_server_status, chat_id, parts[1], None)
+                self._show_server_status(chat_id, parts[1])
             elif action == 'update_srv':
-                self.bot.answer_callback(callback_query_id, '正在加载可更新容器...') if callback_query_id else None
-                self._run_async(self._show_update_containers, chat_id, parts[1], None)
+                self._show_update_containers(chat_id, parts[1])
             elif action == 'update_cnt':
                 server, container = parts[1], parts[2]
                 confirm_msg = f"""⚠️ <b>确认更新</b>
@@ -1552,8 +1550,7 @@ class CommandHandler:
                 else:
                     self._enqueue_remote_action(action, server, container, chat_id, message_id)
             elif action == 'restart_srv':
-                self.bot.answer_callback(callback_query_id, '正在加载可重启容器...') if callback_query_id else None
-                self._run_async(self._show_restart_containers, chat_id, parts[1], None)
+                self._show_restart_containers(chat_id, parts[1])
             elif action == 'restart_cnt':
                 server, container = parts[1], parts[2]
                 confirm_msg = f"""⚠️ <b>确认重启</b>
