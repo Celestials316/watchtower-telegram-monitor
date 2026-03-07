@@ -303,21 +303,19 @@ docker exec watchtower-notifier sh -c "cat /data/server_registry.json && echo &&
 
 ## 🔄 更新日志
 
+### v5.3.3 (2026-03-07)
+- ✨ 健康检查改为内部心跳机制，修复 `watchtower` 与 `watchtower-notifier` 误报 `unhealthy`
+- 🛡️ 修复多服务器配置与注册表并发写入问题，增强共享状态文件可靠性
+- 🔄 手动更新支持失败自动回滚，并在成功后定向清理旧镜像残留
+- 🎯 新增 `MONITORED_CONTAINERS` 固定监控名单与 `HEALTHCHECK_MAX_AGE` 配置项
+- 🧰 重构 `scripts/manage.sh`，修正部署路径、状态文件和配置展示逻辑
+- 📝 同步更新 README 与安装文档中的推荐 `yml`、命令说明和排障示例
+
 ### v3.5.0 (2025-11-06)
 - ✨ 支持多服务器统一管理
 - 🌐 `/servers` 命令查看所有在线服务器
 - 💓 服务器心跳机制
 - 🎯 交互命令支持服务器选择
-
-### v3.4.0 (2025-11-05)
-- ✨ 新增 13 个交互式 Telegram 命令
-- ⚙️ 支持动态配置
-- 📊 实时查看状态
-
-### v3.3.0 (2025-11-04)
-- ✨ 重构核心逻辑
-- 🐛 修复变量传递问题
-- ⚡ 性能优化
 
 ## 📄 许可证
 
