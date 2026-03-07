@@ -115,6 +115,12 @@ class FileLock:
                self.acquired = True
                return self
            except FileExistsError:
+               try:
+                   if self.lock_path.exists() and time.time() - self.lock_path.stat().st_mtime > self.timeout:
+                       self.lock_path.unlink(missing_ok=True)
+                       continue
+               except Exception:
+                   pass
                if time.time() - start_time > self.timeout:
                    raise TimeoutError(f"无法获取文件锁: {self.file_path}")
                time.sleep(0.1)
