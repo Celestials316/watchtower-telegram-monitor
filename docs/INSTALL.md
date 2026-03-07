@@ -69,11 +69,26 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     environment:
+      - WATCHTOWER_NOTIFICATIONS=
       - WATCHTOWER_NO_STARTUP_MESSAGE=true
-      - TZ=Asia/Shanghai
+      - TZ=${TZ:-Asia/Shanghai}
       - WATCHTOWER_CLEANUP=${CLEANUP:-true}
-      - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-3600}
+      - WATCHTOWER_INCLUDE_RESTARTING=true
+      - WATCHTOWER_INCLUDE_STOPPED=false
+      - WATCHTOWER_NO_RESTART=false
+      - WATCHTOWER_TIMEOUT=10s
+      - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-1800}
+      - WATCHTOWER_DEBUG=false
+      - WATCHTOWER_LOG_LEVEL=info
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      disable: true
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
 
@@ -83,14 +98,26 @@ services:
     restart: unless-stopped
     network_mode: host
     depends_on:
-      - watchtower
+      watchtower:
+        condition: service_started
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./data:/data
-    env_file:
-      - .env
+    env_file: .env
     environment:
-      - TZ=Asia/Shanghai
+      - SERVER_NAME=${SERVER_NAME:-My_Server_Name}
+      - PRIMARY_SERVER=${PRIMARY_SERVER:-false}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python3", "/app/healthcheck.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
 ```
@@ -114,6 +141,8 @@ CLEANUP=true
 
 # 启用自动回滚
 ENABLE_ROLLBACK=true
+# 可选：固定监控名单，多个容器请用逗号分隔
+MONITORED_CONTAINERS=
 EOF
 
 # 编辑配置
@@ -282,11 +311,26 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     environment:
+      - WATCHTOWER_NOTIFICATIONS=
       - WATCHTOWER_NO_STARTUP_MESSAGE=true
-      - TZ=Asia/Shanghai
+      - TZ=${TZ:-Asia/Shanghai}
       - WATCHTOWER_CLEANUP=${CLEANUP:-true}
-      - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-3600}
+      - WATCHTOWER_INCLUDE_RESTARTING=true
+      - WATCHTOWER_INCLUDE_STOPPED=false
+      - WATCHTOWER_NO_RESTART=false
+      - WATCHTOWER_TIMEOUT=10s
+      - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-1800}
+      - WATCHTOWER_DEBUG=false
+      - WATCHTOWER_LOG_LEVEL=info
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      disable: true
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
 
@@ -296,14 +340,26 @@ services:
     restart: unless-stopped
     network_mode: host
     depends_on:
-      - watchtower
+      watchtower:
+        condition: service_started
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - nfs-data:/data
-    env_file:
-      - .env
+    env_file: .env
     environment:
-      - TZ=Asia/Shanghai
+      - SERVER_NAME=${SERVER_NAME:-My_Server_Name}
+      - PRIMARY_SERVER=${PRIMARY_SERVER:-false}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python3", "/app/healthcheck.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
 
@@ -328,11 +384,26 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     environment:
+      - WATCHTOWER_NOTIFICATIONS=
       - WATCHTOWER_NO_STARTUP_MESSAGE=true
-      - TZ=Asia/Shanghai
+      - TZ=${TZ:-Asia/Shanghai}
       - WATCHTOWER_CLEANUP=${CLEANUP:-true}
-      - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-3600}
+      - WATCHTOWER_INCLUDE_RESTARTING=true
+      - WATCHTOWER_INCLUDE_STOPPED=false
+      - WATCHTOWER_NO_RESTART=false
+      - WATCHTOWER_TIMEOUT=10s
+      - WATCHTOWER_POLL_INTERVAL=${POLL_INTERVAL:-1800}
+      - WATCHTOWER_DEBUG=false
+      - WATCHTOWER_LOG_LEVEL=info
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      disable: true
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
 
@@ -342,14 +413,26 @@ services:
     restart: unless-stopped
     network_mode: host
     depends_on:
-      - watchtower
+      watchtower:
+        condition: service_started
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - nfs-data:/data
-    env_file:
-      - .env
+    env_file: .env
     environment:
-      - TZ=Asia/Shanghai
+      - SERVER_NAME=${SERVER_NAME:-My_Server_Name}
+      - PRIMARY_SERVER=${PRIMARY_SERVER:-false}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python3", "/app/healthcheck.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
 
@@ -529,6 +612,12 @@ sudo umount /mnt/test
 **京东云：**
 
 ```yaml
+services:
+  watchtower-notifier:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - nfs-data:/data
+
 volumes:
   nfs-data:
     driver: local
@@ -541,6 +630,12 @@ volumes:
 **其他服务器：**
 
 ```yaml
+services:
+  watchtower-notifier:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - nfs-data:/data
+
 volumes:
   nfs-data:
     driver: local
@@ -651,9 +746,10 @@ docker exec watchtower-notifier ls -la /data
 # 应该看到：
 # server_registry.json
 # monitor_config.json
+# health_status.json
 
 # 查看服务器注册表
-docker exec watchtower-notifier cat /data/server_registry.json
+docker exec watchtower-notifier sh -c "cat /data/server_registry.json && echo && cat /data/health_status.json"
 
 # 应该看到所有服务器的心跳信息
 ```
@@ -865,8 +961,8 @@ sudo tailscale up
 ## 下一步
 
 - 📖 查看 [README.md](../README.md) 了解功能特性
-- ⚙️ 查看 [CONFIGURATION.md](CONFIGURATION.md) 了解高级配置
-- 🐛 遇到问题？查看 [FAQ.md](FAQ.md)
+- ⚙️ 当前高级配置已并入 [README.md](../README.md) 与本文档
+- 🐛 遇到问题？优先查看本文档的故障排查章节
 
 ---
 

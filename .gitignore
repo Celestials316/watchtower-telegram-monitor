@@ -15,6 +15,10 @@ data/
 backups/
 *.backup
 
+# Python 缓存
+__pycache__/
+*.py[cod]
+
 # 临时文件
 tmp/
 temp/

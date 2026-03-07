@@ -9,8 +9,9 @@ import subprocess
 import threading
 import logging
 import fcntl
+import select
 from datetime import datetime
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 import requests
 from pathlib import Path
 
@@ -19,13 +20,26 @@ TELEGRAM_API = f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN')}"
 CHAT_ID = os.getenv('CHAT_ID')
 SERVER_NAME = os.getenv('SERVER_NAME')
 PRIMARY_SERVER = os.getenv('PRIMARY_SERVER', 'false').lower() == 'true'
+ENABLE_ROLLBACK = os.getenv('ENABLE_ROLLBACK', 'true').lower() == 'true'
+CLEANUP_OLD_IMAGES = os.getenv('CLEANUP', 'true').lower() == 'true'
 
 DATA_DIR = Path("/data")
-STATE_FILE = DATA_DIR / "container_state.json"
 MONITOR_CONFIG = DATA_DIR / "monitor_config.json"
 SERVER_REGISTRY = DATA_DIR / "server_registry.json"
+HEALTH_FILE = DATA_DIR / "health_status.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def parse_container_list(value: str) -> Set[str]:
+    if not value:
+        return set()
+
+    normalized = value.replace(',', ' ').replace('\n', ' ')
+    return {item.strip() for item in normalized.split() if item.strip()}
+
+
+STATIC_MONITORED_CONTAINERS = parse_container_list(os.getenv('MONITORED_CONTAINERS', ''))
 
 logging.basicConfig(
    level=logging.INFO,
@@ -126,6 +140,79 @@ def safe_write_json(file_path: Path, data: Dict, max_retries: int = 3) -> bool:
 
    return False
 
+def safe_update_json(file_path: Path, updater: Callable[[Dict], Dict], default: Dict = None,
+                    max_retries: int = 3) -> Optional[Dict]:
+   if default is None:
+       default = {}
+
+   for attempt in range(max_retries):
+       try:
+           with FileLock(file_path, timeout=5):
+               data = default.copy()
+               if file_path.exists():
+                   with open(file_path, 'r', encoding='utf-8') as f:
+                       content = f.read().strip()
+                       if content:
+                           data = json.loads(content)
+
+               updated = updater(data)
+               if updated is None:
+                   updated = data
+
+               temp_path = file_path.with_suffix('.tmp')
+               with open(temp_path, 'w', encoding='utf-8') as f:
+                   json.dump(updated, f, ensure_ascii=False, indent=2)
+                   f.flush()
+                   os.fsync(f.fileno())
+               temp_path.replace(file_path)
+               return updated
+
+       except (json.JSONDecodeError, TimeoutError) as e:
+           logger.error(f"更新文件失败: {file_path} - {e}")
+           if attempt < max_retries - 1:
+               time.sleep(0.5 if isinstance(e, json.JSONDecodeError) else 1)
+
+       except Exception as e:
+           logger.error(f"更新文件失败: {e}")
+           if attempt < max_retries - 1:
+               time.sleep(0.5)
+
+   return None
+
+class HealthReporter:
+    def __init__(self, health_file: Path, server_name: str):
+        self.health_file = health_file
+        self.server_name = server_name
+        self._lock = threading.Lock()
+        self._state = {
+            'pid': os.getpid(),
+            'server_name': server_name,
+            'version': VERSION,
+            'started_at': time.time(),
+            'updated_at': time.time(),
+            'components': {}
+        }
+
+    def beat(self, component: str, status: str = 'ok', details: Optional[Dict] = None):
+        with self._lock:
+            now = time.time()
+            self._state['pid'] = os.getpid()
+            self._state['updated_at'] = now
+
+            component_state = {
+                'status': status,
+                'updated_at': now
+            }
+
+            if details:
+                component_state['details'] = details
+
+            self._state['components'][component] = component_state
+            safe_write_json(self.health_file, self._state)
+
+    def fail(self, component: str, error: Exception):
+        self.beat(component, status='error', details={'error': str(error)[:200]})
+
 class CommandCoordinator:
    def __init__(self, server_name: str, primary_server: bool, registry_file: Path):
        self.server_name = server_name
@@ -142,7 +229,7 @@ class CommandCoordinator:
            return True
 
        coordinated_commands = ['/status', '/update', '/restart', '/monitor', '/help', '/servers']
-       
+
        if not any(command.startswith(cmd) for cmd in coordinated_commands):
            return True
 
@@ -164,7 +251,7 @@ class CommandCoordinator:
        if len(parts) >= 2:
            server_target_actions = [
                'status_srv', 'update_srv', 'restart_srv', 'monitor_srv',
-               'update_cnt', 'restart_cnt', 'confirm_restart', 
+               'update_cnt', 'restart_cnt', 'confirm_restart',
                'confirm_update', 'add_mon', 'rem_mon'
            ]
 
@@ -186,7 +273,7 @@ class TelegramBot:
        self.session.headers.update({'Connection': 'keep-alive'})
        self._last_edit = {}  # 记录上次编辑时间，避免频繁编辑
 
-   def send_message(self, text: str, reply_markup: Optional[Dict] = None, 
+   def send_message(self, text: str, reply_markup: Optional[Dict] = None,
                     max_retries: int = 3) -> bool:
        for attempt in range(max_retries):
            try:
@@ -219,20 +306,20 @@ class TelegramBot:
 
        return False
 
-   def edit_message(self, chat_id: str, message_id: str, text: str, 
+   def edit_message(self, chat_id: str, message_id: str, text: str,
                     reply_markup: Optional[Dict] = None, max_retries: int = 3) -> bool:
        """编辑消息，添加防抖和重试机制"""
        edit_key = f"{chat_id}:{message_id}"
-       
+
        # 防抖：距离上次编辑少于0.5秒则跳过
        current_time = time.time()
        if edit_key in self._last_edit:
            if current_time - self._last_edit[edit_key] < 0.5:
                logger.debug(f"跳过频繁编辑: {message_id}")
                return False
-       
+
        self._last_edit[edit_key] = current_time
-       
+
        for attempt in range(max_retries):
            try:
                payload = {
@@ -249,7 +336,7 @@ class TelegramBot:
                    json=payload,
                    timeout=30
                )
-               
+
                if response.status_code == 200:
                    return True
                else:
@@ -258,7 +345,7 @@ class TelegramBot:
                    if 'message is not modified' in error_desc.lower():
                        return True
                    logger.debug(f"编辑消息失败: {error_desc}")
-                   
+
            except Exception as e:
                logger.debug(f"编辑消息异常: {e}")
 
@@ -312,7 +399,7 @@ class DockerManager:
            )
            if result.returncode == 0:
                containers = result.stdout.strip().split('\n')
-               return [c for c in containers 
+               return [c for c in containers
                       if c and c not in ['watchtower', 'watchtower-notifier']]
        except Exception as e:
            logger.error(f"获取容器列表失败: {e}")
@@ -361,30 +448,184 @@ class DockerManager:
            'new_version': ''
        }
 
+       backup_tag = None
+
+       def build_run_cmd(config: Dict, image_ref: str) -> List[str]:
+           host_config = config.get('HostConfig', {})
+           container_config = config.get('Config', {})
+           run_cmd = ['docker', 'run', '-d', '--name', container]
+
+           network_mode = host_config.get('NetworkMode', 'bridge')
+           if network_mode:
+               run_cmd.extend(['--network', network_mode])
+
+           restart_policy = host_config.get('RestartPolicy', {}) or {}
+           restart_name = restart_policy.get('Name')
+           if restart_name:
+               if restart_name == 'on-failure' and restart_policy.get('MaximumRetryCount'):
+                   run_cmd.extend(['--restart', f"{restart_name}:{restart_policy['MaximumRetryCount']}"])
+               else:
+                   run_cmd.extend(['--restart', restart_name])
+
+           if host_config.get('Privileged'):
+               run_cmd.append('--privileged')
+           if host_config.get('ReadonlyRootfs'):
+               run_cmd.append('--read-only')
+           if host_config.get('ShmSize'):
+               run_cmd.extend(['--shm-size', str(host_config['ShmSize'])])
+           if host_config.get('NanoCpus'):
+               run_cmd.extend(['--cpus', str(host_config['NanoCpus'] / 1_000_000_000)])
+           if host_config.get('Memory'):
+               run_cmd.extend(['--memory', str(host_config['Memory'])])
+           if host_config.get('PidsLimit') and host_config.get('PidsLimit') > 0:
+               run_cmd.extend(['--pids-limit', str(host_config['PidsLimit'])])
+
+           if container_config.get('WorkingDir'):
+               run_cmd.extend(['-w', container_config['WorkingDir']])
+           if container_config.get('User'):
+               run_cmd.extend(['-u', container_config['User']])
+           if container_config.get('Hostname'):
+               run_cmd.extend(['--hostname', container_config['Hostname']])
+
+           for env in container_config.get('Env', []) or []:
+               run_cmd.extend(['-e', env])
+
+           labels = container_config.get('Labels') or {}
+           for key, value in labels.items():
+               if key.startswith('com.docker.compose.'):
+                   continue
+               run_cmd.extend(['--label', key if value in (None, '') else f'{key}={value}'])
+
+           log_config = host_config.get('LogConfig', {}) or {}
+           if log_config.get('Type'):
+               run_cmd.extend(['--log-driver', log_config['Type']])
+               for key, value in (log_config.get('Config') or {}).items():
+                   run_cmd.extend(['--log-opt', f'{key}={value}'])
+
+           for extra_host in host_config.get('ExtraHosts') or []:
+               run_cmd.extend(['--add-host', extra_host])
+           for cap in host_config.get('CapAdd') or []:
+               run_cmd.extend(['--cap-add', cap])
+           for cap in host_config.get('CapDrop') or []:
+               run_cmd.extend(['--cap-drop', cap])
+           for dns in host_config.get('Dns') or []:
+               run_cmd.extend(['--dns', dns])
+           for dns_search in host_config.get('DnsSearch') or []:
+               run_cmd.extend(['--dns-search', dns_search])
+
+           for mount in config.get('Mounts', []) or []:
+               source = mount.get('Name') or mount.get('Source')
+               destination = mount.get('Destination')
+               if not source or not destination:
+                   continue
+
+               mount_spec = f'{source}:{destination}'
+               mode = mount.get('Mode') or ''
+               if mode:
+                   mount_spec += f':{mode}'
+               elif mount.get('RW') is False:
+                   mount_spec += ':ro'
+               run_cmd.extend(['-v', mount_spec])
+
+           if network_mode != 'host':
+               port_bindings = host_config.get('PortBindings', {}) or {}
+               for container_port, host_configs in port_bindings.items():
+                   for host_cfg in host_configs or []:
+                       host_port = host_cfg.get('HostPort', '')
+                       if not host_port:
+                           continue
+                       host_ip = host_cfg.get('HostIp', '')
+                       mapping = ''
+                       if host_ip and host_ip != '0.0.0.0':
+                           mapping += f'{host_ip}:'
+                       mapping += f'{host_port}:{container_port}'
+                       run_cmd.extend(['-p', mapping])
+
+           entrypoint = container_config.get('Entrypoint')
+           cmd_args = []
+           if isinstance(entrypoint, list) and entrypoint:
+               run_cmd.extend(['--entrypoint', entrypoint[0]])
+               cmd_args.extend(entrypoint[1:])
+           elif isinstance(entrypoint, str) and entrypoint:
+               run_cmd.extend(['--entrypoint', entrypoint])
+
+           cmd = container_config.get('Cmd')
+           if isinstance(cmd, list):
+               cmd_args.extend(cmd)
+           elif isinstance(cmd, str) and cmd:
+               cmd_args.append(cmd)
+
+           run_cmd.append(image_ref)
+           run_cmd.extend(cmd_args)
+           return run_cmd
+
+       def rollback_container(config: Dict, reason: str) -> str:
+           if not ENABLE_ROLLBACK or not backup_tag:
+               return reason
+
+           logger.warning(f'更新失败，准备自动回滚容器 {container}')
+           if progress_callback:
+               progress_callback('↩️ 更新失败，正在自动回滚...')
+
+           subprocess.run(['docker', 'rm', '-f', container], capture_output=True, text=True, timeout=30)
+           rollback_cmd = build_run_cmd(config, backup_tag)
+           rollback_result = subprocess.run(
+               rollback_cmd,
+               capture_output=True, text=True, timeout=60
+           )
+
+           if rollback_result.returncode == 0:
+               return f'{reason}；已自动回滚到旧镜像'
+
+           return f"{reason}；自动回滚失败: {(rollback_result.stderr or rollback_result.stdout)[:200]}"
+
        try:
            if progress_callback:
-               progress_callback("📋 正在获取容器信息...")
+               progress_callback('📋 正在获取容器信息...')
 
            old_info = DockerManager.get_container_info(container)
            if not old_info:
-               result['message'] = "无法获取容器信息"
+               result['message'] = '无法获取容器信息'
                return result
 
+           inspect_result = subprocess.run(
+               ['docker', 'inspect', container],
+               capture_output=True, text=True, timeout=10
+           )
+           if inspect_result.returncode != 0:
+               result['message'] = '无法获取容器配置'
+               return result
+
+           config = json.loads(inspect_result.stdout)[0]
            image = old_info['image']
            old_image_id = old_info['image_id']
            result['old_version'] = DockerManager._format_version_info(old_info, container)
 
-           if progress_callback:
-               progress_callback(f"🔄 正在拉取镜像: {image}")
+           if ENABLE_ROLLBACK:
+               safe_container = ''.join(
+                   ch if ch.isalnum() or ch in '._-' else '-'
+                   for ch in container.lower()
+               ).strip('-') or 'container'
+               backup_tag = f'watchtower-rollback/{safe_container}:{int(time.time())}'
+               backup_result = subprocess.run(
+                   ['docker', 'image', 'tag', old_image_id, backup_tag],
+                   capture_output=True, text=True, timeout=20
+               )
+               if backup_result.returncode != 0:
+                   logger.warning(f'创建回滚镜像标签失败: {(backup_result.stderr or backup_result.stdout)[:200]}')
+                   backup_tag = None
 
-           logger.info(f"拉取镜像: {image}")
+           if progress_callback:
+               progress_callback(f'🔄 正在拉取镜像: {image}')
+
+           logger.info(f'拉取镜像: {image}')
            pull_result = subprocess.run(
                ['docker', 'pull', image],
                capture_output=True, text=True, timeout=300
            )
 
            if pull_result.returncode != 0:
-               result['message'] = f"拉取镜像失败: {pull_result.stderr[:200]}"
+               result['message'] = f"拉取镜像失败: {(pull_result.stderr or pull_result.stdout)[:200]}"
                return result
 
            new_inspect = subprocess.run(
@@ -395,75 +636,49 @@ class DockerManager:
            if new_inspect.returncode == 0:
                new_image_id = new_inspect.stdout.strip()
                if new_image_id == old_image_id:
-                   result['message'] = "镜像已是最新版本，无需更新"
+                   result['message'] = '镜像已是最新版本，无需更新'
                    result['success'] = True
                    return result
 
            if progress_callback:
-               progress_callback("📦 正在获取容器配置...")
+               progress_callback('⏸️ 正在停止旧容器...')
 
-           inspect_result = subprocess.run(
-               ['docker', 'inspect', container],
-               capture_output=True, text=True, timeout=10
+           logger.info(f'停止容器: {container}')
+           stop_result = subprocess.run(
+               ['docker', 'stop', container],
+               capture_output=True, text=True, timeout=30
            )
-
-           if inspect_result.returncode != 0:
-               result['message'] = "无法获取容器配置"
+           if stop_result.returncode != 0:
+               result['message'] = f"停止旧容器失败: {(stop_result.stderr or stop_result.stdout)[:200]}"
                return result
 
-           config = json.loads(inspect_result.stdout)[0]
+           if progress_callback:
+               progress_callback('🗑️ 正在删除旧容器...')
 
-           env_vars = config['Config'].get('Env', [])
-           volumes = []
-           for mount in config['Mounts']:
-               volumes.extend(['-v', f"{mount['Source']}:{mount['Destination']}"])
-
-           ports = []
-           port_bindings = config['HostConfig'].get('PortBindings', {})
-           for container_port, host_configs in port_bindings.items():
-               if host_configs:
-                   host_port = host_configs[0].get('HostPort', '')
-                   if host_port:
-                       ports.extend(['-p', f"{host_port}:{container_port.split('/')[0]}"])
-
-           network = config['HostConfig'].get('NetworkMode', 'bridge')
-           restart_policy = config['HostConfig'].get('RestartPolicy', {}).get('Name', 'unless-stopped')
+           logger.info(f'删除容器: {container}')
+           rm_result = subprocess.run(
+               ['docker', 'rm', container],
+               capture_output=True, text=True, timeout=10
+           )
+           if rm_result.returncode != 0:
+               result['message'] = f"删除旧容器失败: {(rm_result.stderr or rm_result.stdout)[:200]}"
+               return result
 
            if progress_callback:
-               progress_callback("⏸️ 正在停止旧容器...")
+               progress_callback('🚀 正在启动新容器...')
 
-           logger.info(f"停止容器: {container}")
-           subprocess.run(['docker', 'stop', container], timeout=30)
-
-           if progress_callback:
-               progress_callback("🗑️ 正在删除旧容器...")
-
-           logger.info(f"删除容器: {container}")
-           subprocess.run(['docker', 'rm', container], timeout=10)
-
-           if progress_callback:
-               progress_callback("🚀 正在启动新容器...")
-
-           logger.info(f"启动新容器: {container}")
-
-           run_cmd = ['docker', 'run', '-d', '--name', container]
-           run_cmd.extend(['--network', network])
-           run_cmd.extend(['--restart', restart_policy])
-
-           for env in env_vars:
-               run_cmd.extend(['-e', env])
-
-           run_cmd.extend(volumes)
-           run_cmd.extend(ports)
-           run_cmd.append(image)
-
+           logger.info(f'启动新容器: {container}')
+           run_cmd = build_run_cmd(config, image)
            run_result = subprocess.run(
                run_cmd,
                capture_output=True, text=True, timeout=60
            )
 
            if run_result.returncode != 0:
-               result['message'] = f"启动新容器失败: {run_result.stderr[:200]}"
+               result['message'] = rollback_container(
+                   config,
+                   f"启动新容器失败: {(run_result.stderr or run_result.stdout)[:200]}"
+               )
                return result
 
            time.sleep(5)
@@ -472,19 +687,31 @@ class DockerManager:
            if new_info and new_info.get('running'):
                result['new_version'] = DockerManager._format_version_info(new_info, container)
                result['success'] = True
-               result['message'] = "容器更新成功"
+               result['message'] = '容器更新成功'
            else:
-               result['message'] = "容器启动失败，请检查日志"
+               result['message'] = rollback_container(config, '容器启动失败，请检查日志')
 
            return result
 
        except subprocess.TimeoutExpired:
-           result['message'] = "操作超时"
+           result['message'] = rollback_container(config, '操作超时') if 'config' in locals() else '操作超时'
            return result
        except Exception as e:
-           result['message'] = f"更新失败: {str(e)[:200]}"
-           logger.error(f"更新容器 {container} 失败: {e}")
+           result['message'] = rollback_container(config, f'更新失败: {str(e)[:200]}') if 'config' in locals() else f'更新失败: {str(e)[:200]}'
+           logger.error(f'更新容器 {container} 失败: {e}')
            return result
+       finally:
+           if backup_tag and result.get('success'):
+               subprocess.run(
+                   ['docker', 'image', 'rm', backup_tag],
+                   capture_output=True, text=True, timeout=20
+               )
+
+           if result.get('success') and CLEANUP_OLD_IMAGES and 'old_image_id' in locals():
+               subprocess.run(
+                   ['docker', 'image', 'rm', old_image_id],
+                   capture_output=True, text=True, timeout=20
+               )
 
    @staticmethod
    def _format_version_info(info: Dict, container: str) -> str:
@@ -507,7 +734,7 @@ class DockerManager:
        try:
            for _ in range(30):
                check = subprocess.run(
-                   ['docker', 'exec', container, 'test', '-f', 
+                   ['docker', 'exec', container, 'test', '-f',
                     '/app/danmu_api/configs/globals.js'],
                    capture_output=True, timeout=5
                )
@@ -516,7 +743,7 @@ class DockerManager:
                time.sleep(1)
 
            result = subprocess.run(
-               ['docker', 'exec', container, 'cat', 
+               ['docker', 'exec', container, 'cat',
                 '/app/danmu_api/configs/globals.js'],
                capture_output=True, text=True, timeout=10
            )
@@ -534,94 +761,135 @@ class DockerManager:
        return None
 
 class ConfigManager:
-   def __init__(self, config_file: Path, server_name: str):
-       self.config_file = config_file
-       self.server_name = server_name
-       self.config = self._load_config()
+    def __init__(self, config_file: Path, server_name: str):
+        self.config_file = config_file
+        self.server_name = server_name
+        self.config = self._load_config()
 
-   def _load_config(self) -> Dict:
-       return safe_read_json(self.config_file, default={})
+    def _load_config(self) -> Dict:
+        return safe_read_json(self.config_file, default={})
 
-   def _save_config(self):
-       safe_write_json(self.config_file, self.config)
+    def _refresh_config(self) -> Dict:
+        self.config = self._load_config()
+        return self.config
 
-   def get_excluded_containers(self, server: Optional[str] = None) -> Set[str]:
-       server = server or self.server_name
-       return set(self.config.get(server, {}).get('excluded', []))
+    def _update_config(self, updater: Callable[[Dict], Dict]):
+        updated = safe_update_json(self.config_file, updater, default={})
+        if updated is None:
+            return False
+        self.config = updated
+        return True
 
-   def add_excluded(self, container: str, server: Optional[str] = None):
-       server = server or self.server_name
-       if server not in self.config:
-           self.config[server] = {'excluded': []}
+    def get_excluded_containers(self, server: Optional[str] = None) -> Set[str]:
+        server = server or self.server_name
+        config = self._refresh_config()
+        return set(config.get(server, {}).get('excluded', []))
 
-       excluded = set(self.config[server].get('excluded', []))
-       excluded.add(container)
-       self.config[server]['excluded'] = sorted(list(excluded))
-       self._save_config()
+    def add_excluded(self, container: str, server: Optional[str] = None):
+        server = server or self.server_name
 
-   def remove_excluded(self, container: str, server: Optional[str] = None):
-       server = server or self.server_name
-       if server in self.config:
-           excluded = set(self.config[server].get('excluded', []))
-           excluded.discard(container)
-           self.config[server]['excluded'] = sorted(list(excluded))
-           self._save_config()
+        def updater(config: Dict) -> Dict:
+            if server not in config:
+                config[server] = {'excluded': []}
 
-   def is_monitored(self, container: str, server: Optional[str] = None) -> bool:
-       return container not in self.get_excluded_containers(server)
+            excluded = set(config[server].get('excluded', []))
+            excluded.add(container)
+            config[server]['excluded'] = sorted(list(excluded))
+            return config
+
+        self._update_config(updater)
+
+    def remove_excluded(self, container: str, server: Optional[str] = None):
+        server = server or self.server_name
+
+        def updater(config: Dict) -> Dict:
+            if server not in config:
+                return config
+
+            excluded = set(config[server].get('excluded', []))
+            excluded.discard(container)
+            config[server]['excluded'] = sorted(list(excluded))
+            return config
+
+        self._update_config(updater)
+
+    def get_static_monitored_containers(self) -> Set[str]:
+        return set(STATIC_MONITORED_CONTAINERS)
+
+    def has_static_monitor_list(self) -> bool:
+        return bool(STATIC_MONITORED_CONTAINERS)
+
+    def is_monitored(self, container: str, server: Optional[str] = None) -> bool:
+        if container in self.get_excluded_containers(server):
+            return False
+
+        static_containers = self.get_static_monitored_containers()
+        if static_containers:
+            return container in static_containers
+
+        return True
 
 class ServerRegistry:
-   def __init__(self, registry_file: Path, server_name: str, is_primary: bool):
-       self.registry_file = registry_file
-       self.server_name = server_name
-       self.is_primary = is_primary
-       self.heartbeat_interval = 30
-       self.timeout = 120
+    def __init__(self, registry_file: Path, server_name: str, is_primary: bool):
+        self.registry_file = registry_file
+        self.server_name = server_name
+        self.is_primary = is_primary
+        self.heartbeat_interval = 30
+        self.timeout = 120
 
-   def register(self):
-       registry = safe_read_json(self.registry_file, default={})
+    def register(self):
+        all_containers = DockerManager.get_all_containers()
+        config_manager = ConfigManager(MONITOR_CONFIG, self.server_name)
+        monitored_containers = [c for c in all_containers if config_manager.is_monitored(c)]
 
-       all_containers = DockerManager.get_all_containers()
-       config_manager = ConfigManager(MONITOR_CONFIG, self.server_name)
-       monitored_containers = [c for c in all_containers if config_manager.is_monitored(c)]
+        def updater(registry: Dict) -> Dict:
+            registry[self.server_name] = {
+                'last_heartbeat': time.time(),
+                'version': VERSION,
+                'is_primary': self.is_primary,
+                'container_count': len(monitored_containers)
+            }
+            return registry
 
-       registry[self.server_name] = {
-           'last_heartbeat': time.time(),
-           'version': VERSION,
-           'is_primary': self.is_primary,
-           'container_count': len(monitored_containers)
-       }
-       if safe_write_json(self.registry_file, registry):
-           role = "主服务器 🌟" if self.is_primary else "从服务器"
-           logger.info(f"服务器已注册: {self.server_name} ({role}) - 容器: {len(monitored_containers)}个")
-       else:
-           logger.error(f"服务器注册失败: {self.server_name}")
+        updated = safe_update_json(self.registry_file, updater, default={})
+        if updated is not None:
+            role = "主服务器 🌟" if self.is_primary else "从服务器"
+            logger.info(f"服务器已注册: {self.server_name} ({role}) - 容器: {len(monitored_containers)}个")
+        else:
+            logger.error(f"服务器注册失败: {self.server_name}")
 
-   def heartbeat(self):
-       registry = safe_read_json(self.registry_file, default={})
-       if self.server_name in registry:
-           all_containers = DockerManager.get_all_containers()
-           config_manager = ConfigManager(MONITOR_CONFIG, self.server_name)
-           monitored_containers = [c for c in all_containers if config_manager.is_monitored(c)]
+    def heartbeat(self):
+        all_containers = DockerManager.get_all_containers()
+        config_manager = ConfigManager(MONITOR_CONFIG, self.server_name)
+        monitored_containers = [c for c in all_containers if config_manager.is_monitored(c)]
 
-           registry[self.server_name]['last_heartbeat'] = time.time()
-           registry[self.server_name]['is_primary'] = self.is_primary
-           registry[self.server_name]['container_count'] = len(monitored_containers)
-           safe_write_json(self.registry_file, registry)
+        def updater(registry: Dict) -> Dict:
+            if self.server_name not in registry:
+                logger.warning(f"服务器注册信息丢失，重新注册: {self.server_name}")
 
-   def get_active_servers(self) -> List[str]:
-       registry = safe_read_json(self.registry_file, default={})
-       current_time = time.time()
-       active_servers = []
+            registry[self.server_name] = {
+                'last_heartbeat': time.time(),
+                'version': VERSION,
+                'is_primary': self.is_primary,
+                'container_count': len(monitored_containers)
+            }
+            return registry
 
-       for server, info in registry.items():
-           if current_time - info.get('last_heartbeat', 0) < self.timeout:
-               active_servers.append(server)
+        safe_update_json(self.registry_file, updater, default={})
 
-       return sorted(active_servers)
+    def get_active_servers(self) -> List[str]:
+        registry = safe_read_json(self.registry_file, default={})
+        current_time = time.time()
+        active_servers = []
+
+        for server, info in registry.items():
+            if current_time - info.get('last_heartbeat', 0) < self.timeout:
+                active_servers.append(server)
+
+        return sorted(active_servers)
 
 class CommandHandler:
-   def __init__(self, bot: TelegramBot, docker: DockerManager, 
+   def __init__(self, bot: TelegramBot, docker: DockerManager,
                 config: ConfigManager, registry: ServerRegistry):
        self.bot = bot
        self.docker = docker
@@ -746,7 +1014,7 @@ class CommandHandler:
            self._show_update_containers(chat_id, servers[0])
 
    def _show_update_containers(self, chat_id: str, server: str):
-       containers = [c for c in self.docker.get_all_containers() 
+       containers = [c for c in self.docker.get_all_containers()
                     if self.config.is_monitored(c)]
 
        if not containers:
@@ -771,7 +1039,7 @@ class CommandHandler:
            self.bot.send_message("⚠️ 没有可用的服务器")
            return
 
-       
+
        if len(servers) > 1:
            buttons = {
                'inline_keyboard': [
@@ -847,28 +1115,30 @@ class CommandHandler:
 • 然后选择要操作的容器
 • 所有操作通过按钮完成
 • 使用 /status 查看实时状态
+• 设置 <code>MONITORED_CONTAINERS</code> 后将启用固定名单模式
+• <code>ENABLE_ROLLBACK=true</code> 时，更新失败会自动回滚
 ━━━━━━━━━━━━━━━━━━━━"""
 
        self.bot.send_message(help_msg)
 
-   def handle_callback(self, callback_data: str, callback_query_id: str, 
+   def handle_callback(self, callback_data: str, callback_query_id: str,
                       chat_id: str, message_id: str):
        """处理回调，先立即答复，再处理业务逻辑"""
-       
+
        # 防止重复处理同一个回调
        callback_key = f"{callback_query_id}:{callback_data}"
        if callback_key in self._processing_callbacks:
            logger.debug(f"跳过重复回调: {callback_data}")
            return
-       
+
        self._processing_callbacks.add(callback_key)
-       
+
        try:
            parts = callback_data.split(':')
            action = parts[0]
 
            logger.info(f"处理回调: {callback_data}")
-           
+
            # 立即答复回调，避免 Telegram 客户端超时
            self.bot.answer_callback(callback_query_id, "")
 
@@ -905,7 +1175,7 @@ class CommandHandler:
 
                buttons = {
                    'inline_keyboard': [
-                       [{'text': "✅ 确认更新", 
+                       [{'text': "✅ 确认更新",
                          'callback_data': f"confirm_update:{server}:{container}"}],
                        [{'text': "❌ 取消", 'callback_data': "cancel"}]
                    ]
@@ -920,7 +1190,7 @@ class CommandHandler:
                    self.bot.edit_message(chat_id, message_id, current_msg + "📋 准备更新...")
 
                    last_progress = [time.time()]  # 使用列表避免闭包问题
-                   
+
                    def progress_update(msg):
                        # 限制更新频率，避免 API 限制
                        if time.time() - last_progress[0] > 2:
@@ -982,7 +1252,7 @@ class CommandHandler:
 
                buttons = {
                    'inline_keyboard': [
-                       [{'text': "✅ 确认重启", 
+                       [{'text': "✅ 确认重启",
                          'callback_data': f"confirm_restart:{server}:{container}"}],
                        [{'text': "❌ 取消", 'callback_data': "cancel"}]
                    ]
@@ -1032,7 +1302,7 @@ class CommandHandler:
                    else:
                        buttons = {
                            'inline_keyboard': [
-                               [{'text': f"🖥️ {srv}", 
+                               [{'text': f"🖥️ {srv}",
                                  'callback_data': f"monitor_srv:{action_type}:{srv}"}]
                                for srv in servers
                            ]
@@ -1090,7 +1360,7 @@ class CommandHandler:
                self._processing_callbacks.discard(callback_key)
            threading.Thread(target=cleanup, daemon=True).start()
 
-   def _handle_monitor_server(self, chat_id: str, message_id: str, 
+   def _handle_monitor_server(self, chat_id: str, message_id: str,
                               action: str, server: str):
        if action == 'add':
            excluded = self.config.get_excluded_containers()
@@ -1137,274 +1407,309 @@ class CommandHandler:
            )
 
 class BotPoller(threading.Thread):
-   def __init__(self, handler: CommandHandler, bot: TelegramBot, 
-                coordinator: CommandCoordinator):
-       super().__init__(daemon=True)
-       self.handler = handler
-       self.bot = bot
-       self.coordinator = coordinator
-       self.last_update_id = 0
-       self._processed_updates = set()  # 记录已处理的更新ID
+    def __init__(self, handler: CommandHandler, bot: TelegramBot,
+                 coordinator: CommandCoordinator, health_reporter: HealthReporter):
+        super().__init__(daemon=True)
+        self.handler = handler
+        self.bot = bot
+        self.coordinator = coordinator
+        self.health = health_reporter
+        self.last_update_id = 0
+        self._processed_updates = set()
 
-   def run(self):
-       logger.info("Bot 轮询线程已启动")
+    def run(self):
+        logger.info("Bot 轮询线程已启动")
+        self.health.beat('bot_poller', details={'last_update_id': self.last_update_id})
 
-       while not shutdown_flag.is_set():
-           try:
-               updates = self.bot.get_updates(self.last_update_id + 1, timeout=30)
+        while not shutdown_flag.is_set():
+            try:
+                updates = self.bot.get_updates(self.last_update_id + 1, timeout=30)
+                self.health.beat('bot_poller', details={'last_update_id': self.last_update_id})
 
-               if not updates:
-                   continue
+                if not updates:
+                    continue
 
-               for update in updates:
-                   update_id = update.get('update_id', 0)
-                   
-                   # 防止重复处理
-                   if update_id in self._processed_updates:
-                       continue
-                   
-                   self._processed_updates.add(update_id)
-                   self.last_update_id = update_id
-                   
-                   # 清理旧的已处理记录（保留最近1000条）
-                   if len(self._processed_updates) > 1000:
-                       self._processed_updates = set(
-                           sorted(self._processed_updates)[-500:]
-                       )
+                for update in updates:
+                    update_id = update.get('update_id', 0)
 
-                   message = update.get('message', {})
-                   text = message.get('text', '')
-                   chat_id = str(message.get('chat', {}).get('id', ''))
+                    if update_id in self._processed_updates:
+                        continue
 
-                   if text and chat_id == CHAT_ID:
-                       if self.coordinator.should_handle_command(text):
-                           self._handle_command(text, chat_id)
-                       else:
-                           logger.debug(f"命令被其他服务器处理: {text}")
+                    self._processed_updates.add(update_id)
+                    self.last_update_id = update_id
 
-                   callback_query = update.get('callback_query', {})
-                   if callback_query:
-                       callback_data = callback_query.get('data', '')
-                       if self.coordinator.should_handle_command(None, callback_data):
-                           self._handle_callback(callback_query)
-                       else:
-                           logger.debug(f"回调被其他服务器处理: {callback_data}")
+                    if len(self._processed_updates) > 1000:
+                        self._processed_updates = set(
+                            sorted(self._processed_updates)[-500:]
+                        )
 
-           except Exception as e:
-               logger.error(f"轮询错误: {e}")
-               time.sleep(5)
+                    message = update.get('message', {})
+                    text_msg = message.get('text', '')
+                    chat_id = str(message.get('chat', {}).get('id', ''))
 
-   def _handle_command(self, text: str, chat_id: str):
-       try:
-           if text.startswith('/status'):
-               self.handler.handle_status(chat_id)
-           elif text.startswith('/update'):
-               self.handler.handle_update(chat_id)
-           elif text.startswith('/restart'):
-               self.handler.handle_restart(chat_id)
-           elif text.startswith('/monitor'):
-               self.handler.handle_monitor(chat_id)
-           elif text.startswith('/servers'):
-               self.handler.handle_servers(chat_id)
-           elif text.startswith('/help') or text.startswith('/start'):
-               self.handler.handle_help()
-       except Exception as e:
-           logger.error(f"处理命令失败: {e}")
+                    if text_msg and chat_id == CHAT_ID:
+                        if self.coordinator.should_handle_command(text_msg):
+                            self._handle_command(text_msg, chat_id)
+                        else:
+                            logger.debug(f"命令被其他服务器处理: {text_msg}")
 
-   def _handle_callback(self, callback_query: Dict):
-       try:
-           callback_data = callback_query.get('data', '')
-           callback_query_id = callback_query.get('id', '')
-           chat_id = str(callback_query.get('message', {}).get('chat', {}).get('id', ''))
-           message_id = str(callback_query.get('message', {}).get('message_id', ''))
+                    callback_query = update.get('callback_query', {})
+                    if callback_query:
+                        callback_data = callback_query.get('data', '')
+                        if self.coordinator.should_handle_command(None, callback_data):
+                            self._handle_callback(callback_query)
+                        else:
+                            logger.debug(f"回调被其他服务器处理: {callback_data}")
 
-           if chat_id == CHAT_ID:
-               self.handler.handle_callback(
-                   callback_data, callback_query_id, chat_id, message_id
-               )
-       except Exception as e:
-           logger.error(f"处理回调失败: {e}")
+            except Exception as e:
+                self.health.fail('bot_poller', e)
+                logger.error(f"轮询错误: {e}")
+                time.sleep(5)
+
+    def _handle_command(self, text: str, chat_id: str):
+        try:
+            if text.startswith('/status'):
+                self.handler.handle_status(chat_id)
+            elif text.startswith('/update'):
+                self.handler.handle_update(chat_id)
+            elif text.startswith('/restart'):
+                self.handler.handle_restart(chat_id)
+            elif text.startswith('/monitor'):
+                self.handler.handle_monitor(chat_id)
+            elif text.startswith('/servers'):
+                self.handler.handle_servers(chat_id)
+            elif text.startswith('/help') or text.startswith('/start'):
+                self.handler.handle_help()
+        except Exception as e:
+            logger.error(f"处理命令失败: {e}")
+
+    def _handle_callback(self, callback_query: Dict):
+        try:
+            callback_data = callback_query.get('data', '')
+            chat_id = str(callback_query.get('message', {}).get('chat', {}).get('id', ''))
+            message_id = str(callback_query.get('message', {}).get('message_id', ''))
+
+            if chat_id == CHAT_ID:
+                self.handler.handle_callback(
+                    callback_data,
+                    callback_query.get('id', ''),
+                    chat_id,
+                    message_id
+                )
+        except Exception as e:
+            logger.error(f"处理回调失败: {e}")
 
 class HeartbeatThread(threading.Thread):
-   def __init__(self, registry: ServerRegistry):
-       super().__init__(daemon=True)
-       self.registry = registry
+    def __init__(self, registry: ServerRegistry, health_reporter: HealthReporter):
+        super().__init__(daemon=True)
+        self.registry = registry
+        self.health = health_reporter
 
-   def run(self):
-       logger.info("心跳线程已启动")
+    def run(self):
+        logger.info("心跳线程已启动")
+        self.health.beat('heartbeat', details={'interval': self.registry.heartbeat_interval})
 
-       while not shutdown_flag.is_set():
-           try:
-               self.registry.heartbeat()
-               time.sleep(self.registry.heartbeat_interval)
-           except Exception as e:
-               logger.error(f"心跳错误: {e}")
-               time.sleep(5)
+        while not shutdown_flag.is_set():
+            try:
+                self.registry.heartbeat()
+                self.health.beat('heartbeat', details={'interval': self.registry.heartbeat_interval})
+                time.sleep(self.registry.heartbeat_interval)
+            except Exception as e:
+                self.health.fail('heartbeat', e)
+                logger.error(f"心跳错误: {e}")
+                time.sleep(5)
 
 class WatchtowerMonitor:
-   def __init__(self, bot: TelegramBot, docker: DockerManager, 
-                config: ConfigManager):
-       self.bot = bot
-       self.docker = docker
-       self.config = config
-       self.session_data = {}
+    def __init__(self, bot: TelegramBot, docker: DockerManager,
+                 config: ConfigManager, health_reporter: HealthReporter):
+        self.bot = bot
+        self.docker = docker
+        self.config = config
+        self.health = health_reporter
+        self.session_data = {}
 
-   def start(self):
-       logger.info("开始监控 Watchtower 日志...")
-       self._wait_for_watchtower()
+    def start(self):
+        logger.info("开始监控 Watchtower 日志...")
+        self.health.beat('watchtower_monitor', status='starting')
+        self._wait_for_watchtower()
+        process = None
 
-       try:
-           process = subprocess.Popen(
-               ['docker', 'logs', '-f', '--tail', '0', 'watchtower'],
-               stdout=subprocess.PIPE,
-               stderr=subprocess.STDOUT,
-               text=True,
-               bufsize=1
-           )
+        try:
+            process = subprocess.Popen(
+                ['docker', 'logs', '-f', '--tail', '0', 'watchtower'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            self.health.beat('watchtower_monitor', details={'attached': True})
 
-           for line in iter(process.stdout.readline, ''):
-               if shutdown_flag.is_set():
-                   break
+            while not shutdown_flag.is_set():
+                if process.stdout is None:
+                    raise RuntimeError('Watchtower 日志流不可用')
 
-               line = line.strip()
-               if not line:
-                   continue
+                ready, _, _ = select.select([process.stdout], [], [], 5)
+                self.health.beat('watchtower_monitor')
 
-               logger.info(line)
-               self._process_log_line(line)
+                if not ready:
+                    if process.poll() is not None:
+                        raise RuntimeError('Watchtower 日志进程已退出')
+                    continue
 
-       except Exception as e:
-           logger.error(f"监控 Watchtower 日志失败: {e}")
+                line = process.stdout.readline()
+                if not line:
+                    if process.poll() is not None:
+                        raise RuntimeError('Watchtower 日志进程已退出')
+                    continue
 
-   def _wait_for_watchtower(self):
-       logger.info("正在等待 Watchtower 容器启动...")
+                line = line.strip()
+                if not line:
+                    continue
 
-       for _ in range(60):
-           try:
-               result = subprocess.run(
-                   ['docker', 'inspect', '-f', '{{.State.Running}}', 'watchtower'],
-                   capture_output=True, text=True, timeout=5
-               )
-               if result.returncode == 0 and 'true' in result.stdout:
-                   logger.info("Watchtower 已启动")
-                   time.sleep(3)
-                   return
-           except Exception:
-               pass
-           time.sleep(2)
+                logger.info(line)
+                self._process_log_line(line)
 
-       logger.warning("Watchtower 启动超时，继续监控")
+        except Exception as e:
+            self.health.fail('watchtower_monitor', e)
+            logger.error(f"监控 Watchtower 日志失败: {e}")
+            raise
+        finally:
+            if process and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
 
-   def _process_log_line(self, line: str):
-       try:
-           if 'Stopping /' in line:
-               container = self._extract_container_name(line, 'Stopping /')
-               if container and self.config.is_monitored(container):
-                   logger.info(f"→ 捕获到停止: {container}")
-                   self._store_old_state(container)
+    def _wait_for_watchtower(self):
+        logger.info("正在等待 Watchtower 容器启动...")
 
-           elif 'Session done' in line:
-               import re
-               match = re.search(r'Updated=(\d+)', line)
-               if match:
-                   updated = int(match.group(1))
-                   logger.info(f"→ Session 完成: Updated={updated}")
+        for _ in range(60):
+            try:
+                result = subprocess.run(
+                    ['docker', 'inspect', '-f', '{{.State.Running}}', 'watchtower'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0 and 'true' in result.stdout:
+                    logger.info("Watchtower 已启动")
+                    time.sleep(3)
+                    return
+            except Exception:
+                pass
+            time.sleep(2)
 
-                   if updated > 0 and self.session_data:
-                       self._process_updates()
+        logger.warning("Watchtower 启动超时，继续监控")
 
-           elif 'level=error' in line.lower() or 'level=fatal' in line.lower():
-               self._process_error(line)
+    def _process_log_line(self, line: str):
+        try:
+            if 'Stopping /' in line:
+                container = self._extract_container_name(line, 'Stopping /')
+                if container and self.config.is_monitored(container):
+                    logger.info(f"→ 捕获到停止: {container}")
+                    self._store_old_state(container)
 
-       except Exception as e:
-           logger.error(f"处理日志行失败: {e}")
+            elif 'Session done' in line:
+                import re
+                match = re.search(r'Updated=(\d+)', line)
+                if match:
+                    updated = int(match.group(1))
+                    logger.info(f"→ Session 完成: Updated={updated}")
 
-   def _extract_container_name(self, line: str, prefix: str) -> Optional[str]:
-       try:
-           start = line.find(prefix)
-           if start != -1:
-               start += len(prefix)
-               end = line.find(' ', start)
-               if end == -1:
-                   end = len(line)
-               return line[start:end].strip()
-       except Exception:
-           pass
-       return None
+                    if updated > 0 and self.session_data:
+                        self._process_updates()
 
-   def _store_old_state(self, container: str):
-       try:
-           info = self.docker.get_container_info(container)
-           if info:
-               self.session_data[container] = {
-                   'image': info.get('image', 'unknown'),
-                   'image_id': info.get('image_id', 'unknown'),
-                   'version': self.docker.get_danmu_version(container)
-               }
-               logger.info(f"  → 已暂存 {container} 的旧信息")
-       except Exception as e:
-           logger.error(f"存储旧状态失败: {e}")
+            elif 'level=error' in line.lower() or 'level=fatal' in line.lower():
+                self._process_error(line)
 
-   def _process_updates(self):
-       logger.info(f"→ 发现 {len(self.session_data)} 个更新，开始处理...")
+        except Exception as e:
+            logger.error(f"处理日志行失败: {e}")
 
-       for container, old_state in self.session_data.items():
-           try:
-               if not self.config.is_monitored(container):
-                   logger.info(f"→ {container} 已被排除，跳过处理")
-                   continue
+    def _extract_container_name(self, line: str, prefix: str) -> Optional[str]:
+        try:
+            start = line.find(prefix)
+            if start != -1:
+                start += len(prefix)
+                end = line.find(' ', start)
+                if end == -1:
+                    end = len(line)
+                return line[start:end].strip()
+        except Exception:
+            pass
+        return None
 
-               logger.info(f"→ 处理容器: {container}")
-               time.sleep(5)
+    def _store_old_state(self, container: str):
+        try:
+            info = self.docker.get_container_info(container)
+            if info:
+                self.session_data[container] = {
+                    'image': info.get('image', 'unknown'),
+                    'image_id': info.get('image_id', 'unknown'),
+                    'version': self.docker.get_danmu_version(container)
+                }
+                logger.info(f"  → 已暂存 {container} 的旧信息")
+        except Exception as e:
+            logger.error(f"存储旧状态失败: {e}")
 
-               for _ in range(60):
-                   info = self.docker.get_container_info(container)
-                   if info.get('running'):
-                       logger.info("  → 容器已启动")
-                       time.sleep(5)
-                       break
-                   time.sleep(1)
+    def _process_updates(self):
+        logger.info(f"→ 发现 {len(self.session_data)} 个更新，开始处理...")
 
-               new_info = self.docker.get_container_info(container)
-               new_version = self.docker.get_danmu_version(container)
+        for container, old_state in self.session_data.items():
+            try:
+                if not self.config.is_monitored(container):
+                    logger.info(f"→ {container} 已被排除，跳过处理")
+                    continue
 
-               old_ver = self._format_version(old_state, container)
-               new_ver = self._format_version({
-                   'image': new_info.get('image', 'unknown'),
-                   'image_id': new_info.get('image_id', 'unknown'),
-                   'version': new_version
-               }, container)
+                logger.info(f"→ 处理容器: {container}")
+                time.sleep(5)
 
-               self._send_update_notification(
-                   container, 
-                   new_info.get('image', 'unknown').split(':')[0],
-                   old_ver, 
-                   new_ver,
-                   new_info.get('running', False)
-               )
+                for _ in range(60):
+                    info = self.docker.get_container_info(container)
+                    if info.get('running'):
+                        logger.info("  → 容器已启动")
+                        time.sleep(5)
+                        break
+                    time.sleep(1)
 
-           except Exception as e:
-               logger.error(f"处理容器 {container} 更新失败: {e}")
+                new_info = self.docker.get_container_info(container)
+                new_version = self.docker.get_danmu_version(container)
 
-       self.session_data.clear()
-       logger.info("→ 所有更新处理完成")
+                old_ver = self._format_version(old_state, container)
+                new_ver = self._format_version({
+                    'image': new_info.get('image', 'unknown'),
+                    'image_id': new_info.get('image_id', 'unknown'),
+                    'version': new_version
+                }, container)
 
-   def _format_version(self, state: Dict, container: str) -> str:
-       image_id = state.get('image_id', 'unknown')
-       id_short = image_id.replace('sha256:', '')[:12]
+                self._send_update_notification(
+                    container,
+                    new_info.get('image', 'unknown').split(':')[0],
+                    old_ver,
+                    new_ver,
+                    new_info.get('running', False)
+                )
 
-       if 'danmu' in container.lower() and state.get('version'):
-           return f"v{state['version']} ({id_short})"
-       else:
-           tag = state.get('image', 'unknown:latest').split(':')[-1]
-           return f"{tag} ({id_short})"
+            except Exception as e:
+                logger.error(f"处理容器 {container} 更新失败: {e}")
 
-   def _send_update_notification(self, container: str, image: str, 
+        self.session_data.clear()
+        logger.info("→ 所有更新处理完成")
+
+    def _format_version(self, state: Dict, container: str) -> str:
+        image_id = state.get('image_id', 'unknown')
+        id_short = image_id.replace('sha256:', '')[:12]
+
+        if 'danmu' in container.lower() and state.get('version'):
+            return f"v{state['version']} ({id_short})"
+        else:
+            tag = state.get('image', 'unknown:latest').split(':')[-1]
+            return f"{tag} ({id_short})"
+
+    def _send_update_notification(self, container: str, image: str,
                                   old_ver: str, new_ver: str, running: bool):
-       current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-       if running:
-           message = f"""<b>[{self.bot.server_name}]</b> ✨ <b>容器更新成功</b>
+        if running:
+            message = f"""<b>[{self.bot.server_name}]</b> ✨ <b>容器更新成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📦 <b>容器名称</b>
@@ -1423,8 +1728,8 @@ class WatchtowerMonitor:
 ━━━━━━━━━━━━━━━━━━━━
 
 ✅ 容器已成功启动并运行正常"""
-       else:
-           message = f"""<b>[{self.bot.server_name}]</b> ❌ <b>容器启动失败</b>
+        else:
+            message = f"""<b>[{self.bot.server_name}]</b> ❌ <b>容器启动失败</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📦 <b>容器名称</b>
@@ -1444,32 +1749,32 @@ class WatchtowerMonitor:
 ⚠️ 更新后无法启动
 💡 检查: <code>docker logs {container}</code>"""
 
-       logger.info("  → 发送通知...")
-       self.bot.send_message(message)
+        logger.info("  → 发送通知...")
+        self.bot.send_message(message)
 
-   def _process_error(self, line: str):
-       if any(keyword in line.lower() for keyword in 
-              ['skipping', 'already up to date', 'no new images', 
-               'connection refused', 'timeout']):
-           return
+    def _process_error(self, line: str):
+        if any(keyword in line.lower() for keyword in
+               ['skipping', 'already up to date', 'no new images',
+                'connection refused', 'timeout']):
+            return
 
-       container = None
-       for pattern in ['container=', 'container:', 'container ']:
-           if pattern in line.lower():
-               try:
-                   start = line.lower().find(pattern) + len(pattern)
-                   end = line.find(' ', start)
-                   if end == -1:
-                       end = len(line)
-                   container = line[start:end].strip()
-                   break
-               except Exception:
-                   pass
+        container = None
+        for pattern in ['container=', 'container:', 'container ']:
+            if pattern in line.lower():
+                try:
+                    start = line.lower().find(pattern) + len(pattern)
+                    end = line.find(' ', start)
+                    if end == -1:
+                        end = len(line)
+                    container = line[start:end].strip()
+                    break
+                except Exception:
+                    pass
 
-       if container and container not in ['watchtower', 'watchtower-notifier']:
-           if self.config.is_monitored(container):
-               error_msg = line[:200]
-               self.bot.send_message(f"""<b>[{self.bot.server_name}]</b> ⚠️ <b>Watchtower 严重错误</b>
+        if container and container not in ['watchtower', 'watchtower-notifier']:
+            if self.config.is_monitored(container):
+                error_msg = line[:200]
+                self.bot.send_message(f"""<b>[{self.bot.server_name}]</b> ⚠️ <b>Watchtower 严重错误</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📦 <b>容器</b>: <code>{container}</code>
@@ -1486,14 +1791,17 @@ def main():
         logger.error("错误: 必须设置 BOT_TOKEN 和 CHAT_ID 环境变量")
         sys.exit(1)
 
-    print("=" * 50)
+    print('=' * 50)
     print(f"Docker 容器监控通知服务 v{VERSION}")
     print(f"服务器: {SERVER_NAME}")
     print(f"主服务器: {PRIMARY_SERVER}")
     print(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Python 版本: {sys.version.split()[0]}")
-    print("=" * 50)
+    print('=' * 50)
     print()
+
+    health = HealthReporter(HEALTH_FILE, SERVER_NAME)
+    health.beat('main', status='starting')
 
     bot = TelegramBot(os.getenv('BOT_TOKEN'), CHAT_ID, SERVER_NAME)
     docker = DockerManager()
@@ -1509,13 +1817,13 @@ def main():
 
     handler = CommandHandler(bot, docker, config, registry)
 
-    bot_poller = BotPoller(handler, bot, coordinator)
+    bot_poller = BotPoller(handler, bot, coordinator, health)
     bot_poller.start()
-    logger.info(f"Bot 轮询线程已启动")
+    logger.info("Bot 轮询线程已启动")
 
-    heartbeat = HeartbeatThread(registry)
+    heartbeat = HeartbeatThread(registry, health)
     heartbeat.start()
-    logger.info(f"心跳线程已启动")
+    logger.info("心跳线程已启动")
 
     all_containers = docker.get_all_containers()
     monitored = [c for c in all_containers if config.is_monitored(c)]
@@ -1525,18 +1833,23 @@ def main():
 
     if PRIMARY_SERVER:
         time.sleep(1)
+        registry_data = safe_read_json(SERVER_REGISTRY, default={})
         servers = registry.get_active_servers()
+        primary_server = next(
+            (server for server in servers if registry_data.get(server, {}).get('is_primary', False)),
+            SERVER_NAME if PRIMARY_SERVER else '未知'
+        )
         server_list = "\n".join([
-            f"   • <code>{s}</code>{' 🌟' if registry.is_primary else ''}" 
-            for s in servers
-        ])
+            f"   • <code>{server}</code>{' 🌟' if registry_data.get(server, {}).get('is_primary', False) else ''}"
+            for server in servers
+        ]) or "   • <code>暂无活跃服务器</code>"
 
         startup_msg = f"""🚀 <b>监控服务启动成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 📊 <b>服务信息</b>
    版本: <code>v{VERSION}</code>
-   主服务器: <code>{SERVER_NAME if PRIMARY_SERVER else servers[0] if servers else '未知'}</code> 🌟
+   主服务器: <code>{primary_server}</code> 🌟
    当前服务器: <code>{SERVER_NAME}</code>
    语言: <code>Python {sys.version.split()[0]}</code>
 
@@ -1556,14 +1869,10 @@ def main():
    /monitor - 监控管理
    /help - 显示帮助
 
-💡 <b>新特性 v5.3.2</b>
-   • 修复回调立即响应，避免客户端超时
-   • 修复消息编辑重试机制
-   • 修复服务器协调逻辑
-   • 修复文件锁问题（'a'模式）
-   • 增加心跳超时时间（90->120秒）
-   • 修复多次点击需求问题
-   • 修复消息选项不消失问题
+💡 <b>本版重点</b>
+   • 健康检查改为内部心跳机制
+   • 修复多服务器配置热加载问题
+   • 修复主服务器标记显示问题
 
 ⏰ <b>启动时间</b>
    <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
@@ -1573,26 +1882,34 @@ def main():
 
         bot.send_message(startup_msg)
     else:
-        logger.info(f"从服务器已启动，等待主服务器协调")
+        logger.info("从服务器已启动，等待主服务器协调")
 
     def signal_handler(signum, frame):
         logger.info("收到退出信号，正在关闭...")
+        health.beat('main', status='stopping', details={'signal': signum})
         shutdown_flag.set()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    monitor = WatchtowerMonitor(bot, docker, config)
+    monitor = WatchtowerMonitor(bot, docker, config, health)
+    exit_code = 0
+
     try:
+        health.beat('main', status='running')
         monitor.start()
     except KeyboardInterrupt:
         logger.info("用户中断")
     except Exception as e:
-        logger.error(f"监控异常: {e}")
+        exit_code = 1
+        logger.exception(f"监控异常: {e}")
     finally:
         shutdown_flag.set()
+        health.beat('main', status='stopped', details={'exit_code': exit_code})
         logger.info("服务已停止")
+
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()

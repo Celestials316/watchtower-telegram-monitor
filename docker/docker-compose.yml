@@ -26,11 +26,7 @@ services:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      test: ["CMD", "sh", "-c", "ps aux | grep -v grep | grep -q watchtower"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
+      disable: true
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
 
@@ -44,39 +40,21 @@ services:
         condition: service_started
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - nfs-shared:/data
-    env_file: .env # 加载所有通用配置
+      - ./data:/data
+    env_file: .env
     environment:
-      # --- 服务器特定变量 ---
-      # 在每台服务器上单独设置
       - SERVER_NAME=My_Server_Name
-      # 仅在你的主服务器上设置为 true
-      - PRIMARY_SERVER=false 
+      - PRIMARY_SERVER=false
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      test: ["CMD", "sh", "-c", "ps aux | grep -v grep | grep -q 'command_listener'"]
+      test: ["CMD", "python3", "/app/healthcheck.py"]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 15s
     labels:
       - "com.centurylinklabs.watchtower.enable=false"
-
-volumes:
-  nfs-shared:
-    driver: local
-    driver_opts:
-      type: nfs
-      # --- NFS 配置 ---
-      # NFS 主服务器 (例如 京东云)
-      # o: addr=127.0.0.1,rw,nfsvers=4
-      # device: ":/srv/watchtower-shared"
-      
-      # NFS 客户端 (例如 云电脑 V2, V4)
-      # 请将 IP 替换为你的NFS服务器IP
-      o: addr=100.81.57.28,rw,nfsvers=4
-      device: ":/srv/watchtower-shared"

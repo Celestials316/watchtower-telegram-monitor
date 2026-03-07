@@ -116,7 +116,13 @@ sudo nano /etc/exports
 sudo exportfs -ra
 sudo systemctl restart nfs-kernel-server
 
-# 4. 其他服务器挂载 NFS（修改 docker-compose.yml）
+# 4. 其他服务器把 notifier 的 `/data` 改为 NFS 挂载
+services:
+  watchtower-notifier:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - nfs-data:/data
+
 volumes:
   nfs-data:
     driver: local
@@ -138,6 +144,12 @@ docker compose up -d
 # 2. 开放防火墙端口 2049 和 111
 # 3. 其他服务器挂载时使用公网 IP
 
+services:
+  watchtower-notifier:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - nfs-data:/data
+
 volumes:
   nfs-data:
     driver: local
@@ -155,24 +167,17 @@ volumes:
 
 ```bash
 # 状态查询
-/status      # 查看服务状态
-/servers     # 列出所有服务器
-/containers  # 查看容器列表
-/config      # 查看当前配置
+/status      # 查看当前服务器状态
+/servers     # 列出所有在线服务器
 
 # 操作命令
-/check       # 立即检查更新
-/pause       # 暂停自动检查
-/resume      # 恢复自动检查
-
-# 配置命令
-/interval 3600           # 设置检查间隔
-/monitor nginx mysql     # 监控指定容器
-/rollback on            # 启用自动回滚
+/update      # 选择并更新容器
+/restart     # 选择并重启容器
+/monitor     # 打开监控管理菜单
 
 # 其他
 /help        # 完整帮助
-/logs        # 查看日志
+/start       # 显示帮助并唤醒 Bot
 ```
 
 ## 📋 配置说明
@@ -186,23 +191,19 @@ volumes:
 | `SERVER_NAME` | 服务器标识（多服务器时建议设置） | 空 | ❌ |
 | `POLL_INTERVAL` | 检查间隔（秒） | 3600 | ❌ |
 | `CLEANUP` | 自动清理旧镜像 | true | ❌ |
-| `ENABLE_ROLLBACK` | 启用自动回滚 | true | ❌ |
+| `ENABLE_ROLLBACK` | 更新失败时自动回滚 | true | ❌ |
+| `MONITORED_CONTAINERS` | 固定监控名单，逗号或空格分隔 | 空 | ❌ |
+| `HEALTHCHECK_MAX_AGE` | 健康检查允许的最大心跳延迟（秒） | 120 | ❌ |
 
 ### 监控特定容器
 
 ```bash
 # 方式 1: 环境变量
-MONITORED_CONTAINERS=nginx mysql redis
+MONITORED_CONTAINERS=nginx,mysql,redis
 
-# 方式 2: Telegram 命令
-/monitor nginx mysql redis
-
-# 方式 3: docker-compose.yml
-services:
-  watchtower:
-    command:
-      - nginx
-      - mysql
+# 方式 2: Telegram 交互菜单
+/monitor
+# 然后在 Bot 按钮里添加或移除监控
 ```
 
 ### 代理配置（国内必需）
@@ -236,8 +237,6 @@ docker compose down
 ## 📖 文档
 
 - [安装指南](docs/INSTALL.md) - 详细安装步骤和多服务器配置
-- [配置说明](docs/CONFIGURATION.md) - 高级配置选项
-- [常见问题](docs/FAQ.md) - 故障排查
 
 ## 🔍 工作原理
 
@@ -253,7 +252,7 @@ docker compose down
          │
          ├─→ 发送 Telegram 通知
          ├─→ 处理交互命令
-         ├─→ 记录状态数据库
+         ├─→ 记录共享状态文件
          └─→ 多服务器心跳同步
 ```
 
@@ -297,7 +296,7 @@ showmount -e NFS服务器IP
 docker exec watchtower-notifier ls -la /data
 
 # 查看心跳文件
-docker exec watchtower-notifier cat /data/server_registry.json
+docker exec watchtower-notifier sh -c "cat /data/server_registry.json && echo && cat /data/health_status.json"
 ```
 
 更多问题见 [故障排查文档](docs/INSTALL.md#故障排查)
