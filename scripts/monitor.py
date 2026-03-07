@@ -8,6 +8,7 @@ import signal
 import subprocess
 import threading
 import logging
+import uuid
 import fcntl
 import hashlib
 import html as html_lib
@@ -40,6 +41,7 @@ DATA_DIR = Path("/data")
 MONITOR_CONFIG = DATA_DIR / "monitor_config.json"
 SERVER_REGISTRY = DATA_DIR / "server_registry.json"
 UPDATE_STATE_FILE = DATA_DIR / "update_state.json"
+COMMAND_QUEUE_FILE = DATA_DIR / "command_queue.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOCK_DIR = DATA_DIR / 'locks'
@@ -294,6 +296,63 @@ class UpdateStateManager:
             return data
 
         safe_update_json(self.state_file, updater, default={})
+
+class RemoteCommandQueue:
+    def __init__(self, queue_file: Path):
+        self.queue_file = queue_file
+
+    def enqueue(self, target_server: str, action: str, payload: Dict) -> str:
+        job_id = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+
+        def updater(data: Dict) -> Dict:
+            jobs = data.setdefault('jobs', [])
+            jobs.append({
+                'id': job_id,
+                'target_server': target_server,
+                'action': action,
+                'payload': payload,
+                'status': 'pending',
+                'created_at': time.time()
+            })
+            cutoff = time.time() - 86400
+            data['jobs'] = [job for job in jobs if job.get('created_at', 0) >= cutoff and job.get('status') != 'done']
+            return data
+
+        safe_update_json(self.queue_file, updater, default={})
+        return job_id
+
+    def claim(self, target_server: str) -> Optional[Dict]:
+        claimed = {}
+
+        def updater(data: Dict) -> Dict:
+            jobs = data.setdefault('jobs', [])
+            for job in jobs:
+                if job.get('target_server') != target_server or job.get('status') != 'pending':
+                    continue
+                job['status'] = 'processing'
+                job['claimed_at'] = time.time()
+                claimed.update(job)
+                break
+            return data
+
+        safe_update_json(self.queue_file, updater, default={})
+        return claimed or None
+
+    def complete(self, job_id: str, error: Optional[str] = None):
+        def updater(data: Dict) -> Dict:
+            jobs = data.setdefault('jobs', [])
+            for job in jobs:
+                if job.get('id') == job_id:
+                    job['status'] = 'done'
+                    job['completed_at'] = time.time()
+                    if error:
+                        job['error'] = error[:300]
+                    break
+            cutoff = time.time() - 3600
+            data['jobs'] = [job for job in jobs if not (job.get('status') == 'done' and job.get('completed_at', 0) < cutoff)]
+            return data
+
+        safe_update_json(self.queue_file, updater, default={})
 
 class CommandCoordinator:
    def __init__(self, server_name: str, primary_server: bool, registry_file: Path):
@@ -1071,85 +1130,106 @@ class ServerRegistry:
         return sorted(active_servers)
 
 class CommandHandler:
-   def __init__(self, bot: TelegramBot, docker: DockerManager,
-                config: ConfigManager, registry: ServerRegistry):
-       self.bot = bot
-       self.docker = docker
-       self.config = config
-       self.registry = registry
-       self._processing_callbacks = set()  # 防止重复处理
+    def __init__(self, bot: TelegramBot, docker: DockerManager,
+                 config: ConfigManager, registry: ServerRegistry):
+        self.bot = bot
+        self.docker = docker
+        self.config = config
+        self.registry = registry
+        self.command_queue = RemoteCommandQueue(COMMAND_QUEUE_FILE)
+        self._processing_callbacks = set()
 
-   def handle_servers(self, chat_id: str):
-       """处理 /servers 命令 - 显示所有服务器状态概览"""
-       servers = self.registry.get_active_servers()
-       registry_data = safe_read_json(self.registry.registry_file, default={})
+    def _is_local_server(self, server: str) -> bool:
+        return server == self.bot.server_name
 
-       if not servers:
-           self.bot.send_message("⚠️ 当前没有活跃的服务器")
-           return
+    def _get_update_state(self) -> Dict:
+        return safe_read_json(UPDATE_STATE_FILE, default={})
 
-       primary_server = None
-       for server, info in registry_data.items():
-           if info.get('is_primary', False):
-               primary_server = server
-               break
+    def _get_server_snapshots(self, server: str) -> Dict[str, Dict]:
+        if self._is_local_server(server):
+            snapshots = {}
+            for container in self.docker.get_all_containers():
+                info = self.docker.get_container_info(container)
+                if info:
+                    snapshots[container] = {
+                        'current_version': self.docker._format_version_info(info, container),
+                        'running': info.get('running', False),
+                        'health': info.get('health'),
+                        'image': info.get('image', 'unknown')
+                    }
+            return snapshots
 
-       server_msg = f"🌐 <b>在线服务器 ({len(servers)})</b>\n\n"
+        data = self._get_update_state()
+        return dict(data.get(server, {}).get('containers', {}))
 
-       for server in servers:
-           server_info = registry_data.get(server, {})
+    def _get_server_containers(self, server: str) -> List[str]:
+        return sorted(self._get_server_snapshots(server).keys())
 
-           last_heartbeat = server_info.get('last_heartbeat', 0)
-           time_diff = time.time() - last_heartbeat
+    def _send_or_edit(self, chat_id: str, text: str, reply_markup: Optional[Dict] = None,
+                      message_id: Optional[str] = None):
+        if message_id:
+            self.bot.edit_message(chat_id, message_id, text, reply_markup)
+        else:
+            self.bot.send_message(text, reply_markup)
 
-           if time_diff < 30:
-               time_text = "刚刚"
-           elif time_diff < 60:
-               time_text = f"{int(time_diff)}秒前"
-           else:
-               minutes = int(time_diff / 60)
-               time_text = f"{minutes}分钟前" if minutes < 60 else f"{int(minutes/60)}小时前"
+    def handle_servers(self, chat_id: str):
+        servers = self.registry.get_active_servers()
+        registry_data = safe_read_json(self.registry.registry_file, default={})
+        if not servers:
+            self.bot.send_message('⚠️ 当前没有活跃的服务器')
+            return
 
-           container_count = server_info.get('container_count', 0)
+        primary_server = next(
+            (server for server, info in registry_data.items() if info.get('is_primary', False)),
+            None
+        )
 
-           server_display = server
-           is_primary = server_info.get('is_primary', False)
-           if is_primary:
-               server_display = f"{server} 🌟"
+        server_msg = f"🌐 <b>在线服务器 ({len(servers)})</b>\n\n"
+        for server in servers:
+            server_info = registry_data.get(server, {})
+            last_heartbeat = server_info.get('last_heartbeat', 0)
+            time_diff = time.time() - last_heartbeat
+            if time_diff < 30:
+                time_text = '刚刚'
+            elif time_diff < 60:
+                time_text = f'{int(time_diff)}秒前'
+            else:
+                minutes = int(time_diff / 60)
+                time_text = f'{minutes}分钟前' if minutes < 60 else f'{int(minutes/60)}小时前'
+            container_count = server_info.get('container_count', 0)
+            marker = ' 🌟' if server_info.get('is_primary', False) else ''
+            server_msg += f"🖥️ <b>{escape_html(server)}{marker}</b> ({container_count}个容器)\n"
+            server_msg += f"   最后心跳: {time_text}\n\n"
 
-           server_msg += f"🖥️ <b>{server_display}</b> ({container_count}个容器)\n"
-           server_msg += f"   最后心跳: {time_text}\n\n"
+        server_msg += '━━━━━━━━━━━━━━━━━━━━\n'
+        server_msg += f"💡 主服务器: <code>{escape_html(primary_server or '未设置')}</code>\n"
+        server_msg += f"⏰ 更新时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+        self.bot.send_message(server_msg)
 
-       server_msg += f"━━━━━━━━━━━━━━━━━━━━\n"
-       server_msg += f"💡 主服务器: <code>{primary_server if primary_server else '未设置'}</code>\n"
-       server_msg += f"⏰ 更新时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+    def handle_status(self, chat_id: str):
+        servers = self.registry.get_active_servers()
+        if len(servers) > 1:
+            buttons = {
+                'inline_keyboard': [
+                    [{'text': f'🖥️ {server}', 'callback_data': f'status_srv:{server}'}]
+                    for server in servers
+                ]
+            }
+            self.bot.send_message('📊 <b>选择要查看状态的服务器：</b>', buttons)
+        else:
+            self._show_server_status(chat_id, servers[0] if servers else SERVER_NAME)
 
-       self.bot.send_message(server_msg)
+    def _show_server_status(self, chat_id: str, server: str, message_id: Optional[str] = None):
+        snapshots = self._get_server_snapshots(server)
+        all_containers = sorted(snapshots.keys())
+        monitored = [container for container in all_containers if self.config.is_monitored(container, server)]
+        excluded = sorted(self.config.get_excluded_containers(server))
 
-   def handle_status(self, chat_id: str):
-       servers = self.registry.get_active_servers()
-
-       if len(servers) > 1:
-           buttons = {
-               'inline_keyboard': [
-                   [{'text': f"🖥️ {srv}", 'callback_data': f"status_srv:{srv}"}]
-                   for srv in servers
-               ]
-           }
-           self.bot.send_message("📊 <b>选择要查看状态的服务器：</b>", buttons)
-       else:
-           self._show_server_status(chat_id, servers[0] if servers else SERVER_NAME)
-
-   def _show_server_status(self, chat_id: str, server: str):
-       all_containers = self.docker.get_all_containers()
-       monitored = [c for c in all_containers if self.config.is_monitored(c)]
-       excluded = self.config.get_excluded_containers()
-
-       status_msg = f"""📊 <b>服务器状态</b>
+        status_msg = f"""📊 <b>服务器状态</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 🖥️ <b>服务器信息</b>
-  名称: <code>{server}</code>
+  名称: <code>{escape_html(server)}</code>
   时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
   版本: <code>v{VERSION}</code>
 
@@ -1160,121 +1240,116 @@ class CommandHandler:
 
 🔍 <b>监控列表</b>"""
 
-       if not monitored:
-           status_msg += "\n   <i>暂无监控容器</i>"
-       else:
-           for container in monitored:
-               info = self.docker.get_container_info(container)
-               status_icon = "✅" if info.get('running') else "❌"
-               tag = info.get('image', '').split(':')[-1] or 'latest'
-               status_msg += f"\n   {status_icon} <code>{container}</code> [{tag}]"
+        if not monitored:
+            status_msg += "\n   <i>暂无监控容器</i>"
+        else:
+            for container in monitored:
+                info = snapshots.get(container, {})
+                running = info.get('running')
+                status_icon = '✅' if running is True else '❌' if running is False else '⚪️'
+                version = info.get('current_version') or info.get('latest_version') or info.get('image', 'unknown')
+                status_msg += f"\n   {status_icon} <code>{escape_html(container)}</code> [{escape_html(version)}]"
 
-       if excluded:
-           status_msg += "\n\n🚫 <b>排除列表</b>"
-           for container in sorted(excluded):
-               status_msg += f"\n   • <code>{container}</code>"
+        if excluded:
+            status_msg += "\n\n🚫 <b>排除列表</b>"
+            for container in excluded:
+                status_msg += f"\n   • <code>{escape_html(container)}</code>"
 
-       status_msg += "\n━━━━━━━━━━━━━━━━━━━━"
-       self.bot.send_message(status_msg)
+        status_msg += "\n━━━━━━━━━━━━━━━━━━━━"
+        self._send_or_edit(chat_id, status_msg, message_id=message_id)
 
-   def handle_update(self, chat_id: str):
-       servers = self.registry.get_active_servers()
+    def handle_update(self, chat_id: str):
+        servers = self.registry.get_active_servers()
+        if not servers:
+            self.bot.send_message('⚠️ 没有可用的服务器')
+            return
+        if len(servers) > 1:
+            buttons = {
+                'inline_keyboard': [
+                    [{'text': f'🖥️ {server}', 'callback_data': f'update_srv:{server}'}]
+                    for server in servers
+                ]
+            }
+            self.bot.send_message('🔄 <b>选择要更新容器的服务器：</b>', buttons)
+        else:
+            self._show_update_containers(chat_id, servers[0])
 
-       if not servers:
-           self.bot.send_message("⚠️ 没有可用的服务器")
-           return
+    def _show_update_containers(self, chat_id: str, server: str, message_id: Optional[str] = None):
+        containers = [container for container in self._get_server_containers(server) if self.config.is_monitored(container, server)]
+        if not containers:
+            self._send_or_edit(chat_id, f'⚠️ 服务器 <code>{escape_html(server)}</code> 没有可更新的容器', message_id=message_id)
+            return
+        buttons = {
+            'inline_keyboard': [
+                [{'text': f'📦 {container}', 'callback_data': f'update_cnt:{server}:{container}'}]
+                for container in containers
+            ]
+        }
+        text = f"🔄 <b>服务器 <code>{escape_html(server)}</code></b>\n\n请选择要更新的容器："
+        self._send_or_edit(chat_id, text, buttons, message_id)
 
-       if len(servers) > 1:
-           buttons = {
-               'inline_keyboard': [
-                   [{'text': f"🖥️ {srv}", 'callback_data': f"update_srv:{srv}"}]
-                   for srv in servers
-               ]
-           }
-           self.bot.send_message("🔄 <b>选择要更新容器的服务器：</b>", buttons)
-       else:
-           self._show_update_containers(chat_id, servers[0])
+    def handle_restart(self, chat_id: str):
+        servers = self.registry.get_active_servers()
+        if not servers:
+            self.bot.send_message('⚠️ 没有可用的服务器')
+            return
+        if len(servers) > 1:
+            buttons = {
+                'inline_keyboard': [
+                    [{'text': f'🖥️ {server}', 'callback_data': f'restart_srv:{server}'}]
+                    for server in servers
+                ]
+            }
+            self.bot.send_message('🔄 <b>选择要重启容器的服务器：</b>', buttons)
+        else:
+            self._show_restart_containers(chat_id, servers[0])
 
-   def _show_update_containers(self, chat_id: str, server: str):
-       containers = [c for c in self.docker.get_all_containers()
-                    if self.config.is_monitored(c)]
+    def _show_restart_containers(self, chat_id: str, server: str, message_id: Optional[str] = None):
+        containers = self._get_server_containers(server)
+        if not containers:
+            self._send_or_edit(chat_id, f'⚠️ 服务器 <code>{escape_html(server)}</code> 没有可重启的容器', message_id=message_id)
+            return
+        buttons = {
+            'inline_keyboard': [
+                [{'text': f'🔄 {container}', 'callback_data': f'restart_cnt:{server}:{container}'}]
+                for container in containers
+            ]
+        }
+        text = f"🔄 <b>服务器 <code>{escape_html(server)}</code></b>\n\n请选择要重启的容器："
+        self._send_or_edit(chat_id, text, buttons, message_id)
 
-       if not containers:
-           self.bot.send_message(f"⚠️ 服务器 <code>{server}</code> 没有可更新的容器")
-           return
+    def handle_monitor(self, chat_id: str):
+        if self.config.has_static_monitor_list():
+            static_list = "\n".join(
+                f'   • <code>{escape_html(container)}</code>'
+                for container in sorted(self.config.get_static_monitored_containers())
+            )
+            self.bot.send_message(
+                '📡 <b>监控管理</b>\n\n'
+                '当前启用了 <code>MONITORED_CONTAINERS</code> 固定名单模式。\n'
+                '如需修改监控范围，请编辑部署环境变量后重启服务。\n\n'
+                f'当前固定名单：\n{static_list if static_list else "   <i>未设置</i>"}'
+            )
+            return
+        buttons = {
+            'inline_keyboard': [
+                [{'text': '➕ 添加监控', 'callback_data': 'monitor_action:add'}],
+                [{'text': '➖ 移除监控', 'callback_data': 'monitor_action:remove'}],
+                [{'text': '📋 查看列表', 'callback_data': 'monitor_action:list'}]
+            ]
+        }
+        self.bot.send_message('📡 <b>监控管理</b>\n\n请选择操作：', buttons)
 
-       buttons = {
-           'inline_keyboard': [
-               [{'text': f"📦 {c}", 'callback_data': f"update_cnt:{server}:{c}"}]
-               for c in containers
-           ]
-       }
-       self.bot.send_message(
-           f"🔄 <b>服务器 <code>{server}</code></b>\n\n请选择要更新的容器：",
-           buttons
-       )
-
-   def handle_restart(self, chat_id: str):
-       servers = self.registry.get_active_servers()
-
-       if not servers:
-           self.bot.send_message("⚠️ 没有可用的服务器")
-           return
-
-
-       if len(servers) > 1:
-           buttons = {
-               'inline_keyboard': [
-                   [{'text': f"🖥️ {srv}", 'callback_data': f"restart_srv:{srv}"}]
-                   for srv in servers
-               ]
-           }
-           self.bot.send_message("🔄 <b>选择要重启容器的服务器：</b>", buttons)
-       else:
-           self._show_restart_containers(chat_id, servers[0])
-
-   def _show_restart_containers(self, chat_id: str, server: str):
-       containers = self.docker.get_all_containers()
-
-       if not containers:
-           self.bot.send_message(f"⚠️ 服务器 <code>{server}</code> 没有可重启的容器")
-           return
-
-       buttons = {
-           'inline_keyboard': [
-               [{'text': f"🔄 {c}", 'callback_data': f"restart_cnt:{server}:{c}"}]
-               for c in containers
-           ]
-       }
-       self.bot.send_message(
-           f"🔄 <b>服务器 <code>{server}</code></b>\n\n请选择要重启的容器：",
-           buttons
-       )
-
-   def handle_monitor(self, chat_id: str):
-       buttons = {
-           'inline_keyboard': [
-               [{'text': "➕ 添加监控", 'callback_data': "monitor_action:add"}],
-               [{'text': "➖ 移除监控", 'callback_data': "monitor_action:remove"}],
-               [{'text': "📋 查看列表", 'callback_data': "monitor_action:list"}]
-           ]
-       }
-       self.bot.send_message("📡 <b>监控管理</b>\n\n请选择操作：", buttons)
-
-   def handle_help(self):
-       servers = self.registry.get_active_servers()
-
-       registry = safe_read_json(self.registry.registry_file, default={})
-       server_lines = []
-       for s in servers:
-           info = registry.get(s, {})
-           is_primary = info.get('is_primary', False)
-           marker = " 🌟" if is_primary else ""
-           server_lines.append(f"   • <code>{s}</code>{marker}")
-
-       server_list = "\n".join(server_lines)
-
-       help_msg = f"""📖 <b>命令帮助</b>
+    def handle_help(self):
+        servers = self.registry.get_active_servers()
+        registry = safe_read_json(self.registry.registry_file, default={})
+        server_lines = []
+        for server in servers:
+            info = registry.get(server, {})
+            marker = ' 🌟' if info.get('is_primary', False) else ''
+            server_lines.append(f'   • <code>{escape_html(server)}</code>{marker}')
+        server_list = "\n".join(server_lines)
+        help_msg = f"""📖 <b>命令帮助</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 <b>可用命令：</b>
@@ -1293,300 +1368,259 @@ class CommandHandler:
 ━━━━━━━━━━━━━━━━━━━━
 💡 <b>使用提示：</b>
 
-• 多服务器时先选择服务器
-• 然后选择要操作的容器
-• 所有操作通过按钮完成
-• 使用 /status 查看实时状态
+• 仅主服务器轮询 Telegram Bot，避免 getUpdates 冲突
+• 远程服务器的状态展示使用共享状态文件
+• 远程服务器的重启/更新通过共享队列分发执行
 • 设置 <code>MONITORED_CONTAINERS</code> 后将启用固定名单模式
 • <code>ENABLE_ROLLBACK=true</code> 时，更新失败会自动回滚
 ━━━━━━━━━━━━━━━━━━━━"""
+        self.bot.send_message(help_msg)
 
-       self.bot.send_message(help_msg)
+    def _execute_update(self, chat_id: str, message_id: str, server: str, container: str):
+        current_msg = f'⏳ 正在更新容器 <code>{escape_html(container)}</code>...\n\n'
+        self.bot.edit_message(chat_id, message_id, current_msg + '📋 准备更新...')
+        last_progress = [time.time()]
 
-   def handle_callback(self, callback_data: str, callback_query_id: str,
-                      chat_id: str, message_id: str):
-       """处理回调，先立即答复，再处理业务逻辑"""
+        def progress_update(msg):
+            if time.time() - last_progress[0] > 2:
+                self.bot.edit_message(chat_id, message_id, current_msg + escape_html(msg))
+                last_progress[0] = time.time()
 
-       # 防止重复处理同一个回调
-       callback_key = f"{callback_query_id}:{callback_data}"
-       if callback_key in self._processing_callbacks:
-           logger.debug(f"跳过重复回调: {callback_data}")
-           return
-
-       self._processing_callbacks.add(callback_key)
-
-       try:
-           parts = callback_data.split(':')
-           action = parts[0]
-
-           logger.info(f"处理回调: {callback_data}")
-
-           # 立即答复回调，避免 Telegram 客户端超时
-           self.bot.answer_callback(callback_query_id, "")
-
-           # 延迟处理，避免消息编辑冲突
-           time.sleep(0.3)
-
-           if action == 'status_srv':
-               server = parts[1]
-               self._show_server_status(chat_id, server)
-
-           elif action == 'update_srv':
-               server = parts[1]
-               self._show_update_containers(chat_id, server)
-
-           elif action == 'update_cnt':
-               server, container = parts[1], parts[2]
-
-               confirm_msg = f"""⚠️ <b>确认更新</b>
+        result = self.docker.update_container(container, progress_update)
+        if result['success']:
+            result_msg = f"""✅ <b>更新成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>{server}</code>
-📦 容器: <code>{container}</code>
-
-<b>更新流程：</b>
-1. 拉取最新镜像
-2. 停止当前容器
-3. 删除旧容器
-4. 启动新容器
-
-⚠️ <b>注意：</b>容器将短暂停止服务
-
-是否继续？
-━━━━━━━━━━━━━━━━━━━━"""
-
-               buttons = {
-                   'inline_keyboard': [
-                       [{'text': "✅ 确认更新",
-                         'callback_data': f"confirm_update:{server}:{container}"}],
-                       [{'text': "❌ 取消", 'callback_data': "cancel"}]
-                   ]
-               }
-               self.bot.edit_message(chat_id, message_id, confirm_msg, buttons)
-
-           elif action == 'confirm_update':
-               server, container = parts[1], parts[2]
-
-               def update_thread():
-                   current_msg = f"⏳ 正在更新容器 <code>{container}</code>...\n\n"
-                   self.bot.edit_message(chat_id, message_id, current_msg + "📋 准备更新...")
-
-                   last_progress = [time.time()]  # 使用列表避免闭包问题
-
-                   def progress_update(msg):
-                       # 限制更新频率，避免 API 限制
-                       if time.time() - last_progress[0] > 2:
-                           self.bot.edit_message(chat_id, message_id, current_msg + msg)
-                           last_progress[0] = time.time()
-
-                   result = self.docker.update_container(container, progress_update)
-
-                   if result['success']:
-                       result_msg = f"""✅ <b>更新成功</b>
-
-━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>{server}</code>
-📦 容器: <code>{container}</code>
+🖥️ 服务器: <code>{escape_html(server)}</code>
+📦 容器: <code>{escape_html(container)}</code>
 
 🔄 <b>版本变更</b>
-  旧: <code>{result['old_version']}</code>
-  新: <code>{result['new_version']}</code>
+  旧: <code>{escape_html(result['old_version'])}</code>
+  新: <code>{escape_html(result['new_version'])}</code>
 
 ⏰ 时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
 ━━━━━━━━━━━━━━━━━━━━
 
-{result['message']}"""
-                   else:
-                       result_msg = f"""❌ <b>更新失败</b>
+{escape_html(result['message'])}"""
+        else:
+            result_msg = f"""❌ <b>更新失败</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>{server}</code>
-📦 容器: <code>{container}</code>
+🖥️ 服务器: <code>{escape_html(server)}</code>
+📦 容器: <code>{escape_html(container)}</code>
 
 ❌ <b>错误信息</b>
-  {result['message']}
+  {escape_html(result['message'])}
 
 💡 <b>建议</b>
   • 检查镜像名称是否正确
   • 查看容器日志排查问题
   • 尝试手动更新容器
 ━━━━━━━━━━━━━━━━━━━━"""
+        self.bot.edit_message(chat_id, message_id, result_msg)
 
-                   self.bot.edit_message(chat_id, message_id, result_msg)
-
-               threading.Thread(target=update_thread, daemon=True).start()
-
-           elif action == 'restart_srv':
-               server = parts[1]
-               self._show_restart_containers(chat_id, server)
-
-           elif action == 'restart_cnt':
-               server, container = parts[1], parts[2]
-
-               confirm_msg = f"""⚠️ <b>确认重启</b>
+    def _execute_restart(self, chat_id: str, message_id: str, server: str, container: str):
+        self.bot.edit_message(chat_id, message_id, f'⏳ 正在重启容器 <code>{escape_html(container)}</code>...')
+        success = self.docker.restart_container(container)
+        if success:
+            result_msg = f"""✅ <b>重启成功</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>{server}</code>
-📦 容器: <code>{container}</code>
-
-是否继续？
-━━━━━━━━━━━━━━━━━━━━"""
-
-               buttons = {
-                   'inline_keyboard': [
-                       [{'text': "✅ 确认重启",
-                         'callback_data': f"confirm_restart:{server}:{container}"}],
-                       [{'text': "❌ 取消", 'callback_data': "cancel"}]
-                   ]
-               }
-               self.bot.edit_message(chat_id, message_id, confirm_msg, buttons)
-
-           elif action == 'confirm_restart':
-               server, container = parts[1], parts[2]
-               self.bot.edit_message(
-                   chat_id, message_id,
-                   f"⏳ 正在重启容器 <code>{container}</code>..."
-               )
-
-               success = self.docker.restart_container(container)
-
-               if success:
-                   result_msg = f"""✅ <b>重启成功</b>
-
-━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>{server}</code>
-📦 容器: <code>{container}</code>
+🖥️ 服务器: <code>{escape_html(server)}</code>
+📦 容器: <code>{escape_html(container)}</code>
 ⏰ 时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
 ━━━━━━━━━━━━━━━━━━━━"""
-               else:
-                   result_msg = f"""❌ <b>重启失败</b>
+        else:
+            result_msg = f"""❌ <b>重启失败</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>{server}</code>
-📦 容器: <code>{container}</code>
+🖥️ 服务器: <code>{escape_html(server)}</code>
+📦 容器: <code>{escape_html(container)}</code>
 
 请检查容器状态
 ━━━━━━━━━━━━━━━━━━━━"""
+        self.bot.edit_message(chat_id, message_id, result_msg)
 
-               self.bot.edit_message(chat_id, message_id, result_msg)
+    def process_remote_job(self, job: Dict):
+        action = job.get('action')
+        payload = job.get('payload', {})
+        chat_id = str(payload.get('chat_id', ''))
+        message_id = str(payload.get('message_id', ''))
+        server = payload.get('server', self.bot.server_name)
+        container = payload.get('container', '')
+        if action == 'confirm_update' and container:
+            self._execute_update(chat_id, message_id, server, container)
+        elif action == 'confirm_restart' and container:
+            self._execute_restart(chat_id, message_id, server, container)
 
-           elif action == 'monitor_action':
-               action_type = parts[1]
+    def _enqueue_remote_action(self, action: str, server: str, container: str, chat_id: str, message_id: str):
+        self.command_queue.enqueue(server, action, {
+            'server': server,
+            'container': container,
+            'chat_id': chat_id,
+            'message_id': message_id
+        })
+        waiting = '⏳ 已提交远程更新任务...' if action == 'confirm_update' else '⏳ 已提交远程重启任务...'
+        self.bot.edit_message(chat_id, message_id, waiting)
 
-               if action_type == 'list':
-                   self.handle_status(chat_id)
-               else:
-                   servers = self.registry.get_active_servers()
-                   if len(servers) == 1:
-                       self._handle_monitor_server(
-                           chat_id, message_id, action_type, servers[0]
-                       )
-                   else:
-                       buttons = {
-                           'inline_keyboard': [
-                               [{'text': f"🖥️ {srv}",
-                                 'callback_data': f"monitor_srv:{action_type}:{srv}"}]
-                               for srv in servers
-                           ]
-                       }
-                       action_text = "添加监控" if action_type == "add" else "移除监控"
-                       self.bot.edit_message(
-                           chat_id, message_id,
-                           f"📡 <b>{action_text}</b>\n\n请选择服务器：",
-                           buttons
-                       )
+    def handle_callback(self, callback_data: str, callback_query_id: str,
+                        chat_id: str, message_id: str):
+        callback_key = f'{callback_query_id}:{callback_data}' if callback_query_id else f'queued:{callback_data}:{message_id}'
+        if callback_key in self._processing_callbacks:
+            logger.debug(f'跳过重复回调: {callback_data}')
+            return
+        self._processing_callbacks.add(callback_key)
 
-           elif action == 'monitor_srv':
-               action_type, server = parts[1], parts[2]
-               self._handle_monitor_server(chat_id, message_id, action_type, server)
+        try:
+            parts = callback_data.split(':')
+            action = parts[0]
+            logger.info(f'处理回调: {callback_data}')
+            if callback_query_id:
+                self.bot.answer_callback(callback_query_id, '')
+            time.sleep(0.2)
 
-           elif action == 'add_mon':
-               server, container = parts[1], parts[2]
-               self.config.remove_excluded(container)
-               self.bot.edit_message(
-                   chat_id, message_id,
-                   f"""✅ <b>添加成功</b>
-
-━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>{server}</code>
-📦 容器: <code>{container}</code>
-
-已将容器添加到监控列表
-━━━━━━━━━━━━━━━━━━━━"""
-               )
-
-           elif action == 'rem_mon':
-               server, container = parts[1], parts[2]
-               self.config.add_excluded(container)
-               self.bot.edit_message(
-                   chat_id, message_id,
-                   f"""✅ <b>移除成功</b>
+            if action == 'status_srv':
+                self._show_server_status(chat_id, parts[1], message_id)
+            elif action == 'update_srv':
+                self._show_update_containers(chat_id, parts[1], message_id)
+            elif action == 'update_cnt':
+                server, container = parts[1], parts[2]
+                confirm_msg = f"""⚠️ <b>确认更新</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>{server}</code>
-📦 容器: <code>{container}</code>
+🖥️ 服务器: <code>{escape_html(server)}</code>
+📦 容器: <code>{escape_html(container)}</code>
 
-已将容器从监控列表移除
+⚠️ <b>注意：</b>容器将短暂停止服务
+
+是否继续？
 ━━━━━━━━━━━━━━━━━━━━"""
-               )
+                buttons = {
+                    'inline_keyboard': [
+                        [{'text': '✅ 确认更新', 'callback_data': f'confirm_update:{server}:{container}'}],
+                        [{'text': '❌ 取消', 'callback_data': 'cancel'}]
+                    ]
+                }
+                self.bot.edit_message(chat_id, message_id, confirm_msg, buttons)
+            elif action == 'confirm_update':
+                server, container = parts[1], parts[2]
+                if self._is_local_server(server):
+                    threading.Thread(target=self._execute_update, args=(chat_id, message_id, server, container), daemon=True).start()
+                else:
+                    self._enqueue_remote_action(action, server, container, chat_id, message_id)
+            elif action == 'restart_srv':
+                self._show_restart_containers(chat_id, parts[1], message_id)
+            elif action == 'restart_cnt':
+                server, container = parts[1], parts[2]
+                confirm_msg = f"""⚠️ <b>确认重启</b>
 
-           elif action == 'cancel':
-               self.bot.edit_message(chat_id, message_id, "❌ 操作已取消")
+━━━━━━━━━━━━━━━━━━━━
+🖥️ 服务器: <code>{escape_html(server)}</code>
+📦 容器: <code>{escape_html(container)}</code>
 
-       except Exception as e:
-           logger.error(f"处理回调异常: {e}")
-       finally:
-           # 延迟清理，确保不会立即处理重复请求
-           def cleanup():
-               time.sleep(2)
-               self._processing_callbacks.discard(callback_key)
-           threading.Thread(target=cleanup, daemon=True).start()
+是否继续？
+━━━━━━━━━━━━━━━━━━━━"""
+                buttons = {
+                    'inline_keyboard': [
+                        [{'text': '✅ 确认重启', 'callback_data': f'confirm_restart:{server}:{container}'}],
+                        [{'text': '❌ 取消', 'callback_data': 'cancel'}]
+                    ]
+                }
+                self.bot.edit_message(chat_id, message_id, confirm_msg, buttons)
+            elif action == 'confirm_restart':
+                server, container = parts[1], parts[2]
+                if self._is_local_server(server):
+                    threading.Thread(target=self._execute_restart, args=(chat_id, message_id, server, container), daemon=True).start()
+                else:
+                    self._enqueue_remote_action(action, server, container, chat_id, message_id)
+            elif action == 'monitor_action':
+                action_type = parts[1]
+                if action_type == 'list':
+                    self.handle_status(chat_id)
+                else:
+                    servers = self.registry.get_active_servers()
+                    if len(servers) == 1:
+                        self._handle_monitor_server(chat_id, message_id, action_type, servers[0])
+                    else:
+                        buttons = {
+                            'inline_keyboard': [
+                                [{'text': f'🖥️ {server}', 'callback_data': f'monitor_srv:{action_type}:{server}'}]
+                                for server in servers
+                            ]
+                        }
+                        action_text = '添加监控' if action_type == 'add' else '移除监控'
+                        self.bot.edit_message(chat_id, message_id, f'📡 <b>{action_text}</b>\n\n请选择服务器：', buttons)
+            elif action == 'monitor_srv':
+                self._handle_monitor_server(chat_id, message_id, parts[1], parts[2])
+            elif action == 'add_mon':
+                server, container = parts[1], parts[2]
+                self.config.remove_excluded(container, server)
+                self.bot.edit_message(chat_id, message_id, f'✅ <b>添加成功</b>\n\n已将 <code>{escape_html(container)}</code> 添加到服务器 <code>{escape_html(server)}</code> 的监控列表')
+            elif action == 'rem_mon':
+                server, container = parts[1], parts[2]
+                self.config.add_excluded(container, server)
+                self.bot.edit_message(chat_id, message_id, f'✅ <b>移除成功</b>\n\n已将 <code>{escape_html(container)}</code> 从服务器 <code>{escape_html(server)}</code> 的监控列表移除')
+            elif action == 'cancel':
+                self.bot.edit_message(chat_id, message_id, '❌ 操作已取消')
+        except Exception as e:
+            logger.error(f'处理回调异常: {e}')
+        finally:
+            def cleanup():
+                time.sleep(2)
+                self._processing_callbacks.discard(callback_key)
+            threading.Thread(target=cleanup, daemon=True).start()
 
-   def _handle_monitor_server(self, chat_id: str, message_id: str,
-                              action: str, server: str):
-       if action == 'add':
-           excluded = self.config.get_excluded_containers()
-           if not excluded:
-               self.bot.edit_message(
-                   chat_id, message_id,
-                   f"✅ 服务器 <code>{server}</code> 所有容器都已在监控中"
-               )
-               return
+    def _handle_monitor_server(self, chat_id: str, message_id: str, action: str, server: str):
+        if action == 'add':
+            excluded = sorted(self.config.get_excluded_containers(server))
+            if not excluded:
+                self.bot.edit_message(chat_id, message_id, f'✅ 服务器 <code>{escape_html(server)}</code> 所有容器都已在监控中')
+                return
+            buttons = {
+                'inline_keyboard': [
+                    [{'text': f'➕ {container}', 'callback_data': f'add_mon:{server}:{container}'}]
+                    for container in excluded
+                ]
+            }
+            text = f'📡 <b>添加监控</b>\n\n🖥️ 服务器: <code>{escape_html(server)}</code>\n\n请选择要添加监控的容器：'
+            self.bot.edit_message(chat_id, message_id, text, buttons)
+        else:
+            monitored = [container for container in self._get_server_containers(server) if self.config.is_monitored(container, server)]
+            if not monitored:
+                self.bot.edit_message(chat_id, message_id, f'⚠️ 服务器 <code>{escape_html(server)}</code> 当前没有监控中的容器')
+                return
+            buttons = {
+                'inline_keyboard': [
+                    [{'text': f'➖ {container}', 'callback_data': f'rem_mon:{server}:{container}'}]
+                    for container in monitored
+                ]
+            }
+            text = f'📡 <b>移除监控</b>\n\n🖥️ 服务器: <code>{escape_html(server)}</code>\n\n请选择要移除监控的容器：'
+            self.bot.edit_message(chat_id, message_id, text, buttons)
 
-           buttons = {
-               'inline_keyboard': [
-                   [{'text': f"➕ {c}", 'callback_data': f"add_mon:{server}:{c}"}]
-                   for c in sorted(excluded)
-               ]
-           }
-           self.bot.edit_message(
-               chat_id, message_id,
-               f"📡 <b>添加监控</b>\n\n🖥️ 服务器: <code>{server}</code>\n\n请选择要添加监控的容器：",
-               buttons
-           )
+class RemoteCommandWorker(threading.Thread):
+    def __init__(self, handler: CommandHandler, queue: RemoteCommandQueue, server_name: str, health_reporter: HealthReporter):
+        super().__init__(daemon=True)
+        self.handler = handler
+        self.queue = queue
+        self.server_name = server_name
+        self.health = health_reporter
 
-       else:
-           all_containers = self.docker.get_all_containers()
-           monitored = [c for c in all_containers if self.config.is_monitored(c)]
-
-           if not monitored:
-               self.bot.edit_message(
-                   chat_id, message_id,
-                   f"⚠️ 服务器 <code>{server}</code> 当前没有监控中的容器"
-               )
-               return
-
-           buttons = {
-               'inline_keyboard': [
-                   [{'text': f"➖ {c}", 'callback_data': f"rem_mon:{server}:{c}"}]
-                   for c in monitored
-               ]
-           }
-           self.bot.edit_message(
-               chat_id, message_id,
-               f"📡 <b>移除监控</b>\n\n🖥️ 服务器: <code>{server}</code>\n\n请选择要移除监控的容器：",
-               buttons
-           )
+    def run(self):
+        logger.info('远程命令工作线程已启动')
+        while not shutdown_flag.is_set():
+            try:
+                self.health.beat('remote_worker', details={'server': self.server_name})
+                job = self.queue.claim(self.server_name)
+                if not job:
+                    time.sleep(1)
+                    continue
+                self.handler.process_remote_job(job)
+                self.queue.complete(job['id'])
+            except Exception as e:
+                self.health.fail('remote_worker', e)
+                logger.error(f'远程命令处理失败: {e}')
+                time.sleep(2)
 
 class BotPoller(threading.Thread):
     def __init__(self, handler: CommandHandler, bot: TelegramBot,
@@ -1912,6 +1946,8 @@ class WatchtowerMonitor:
             'image': image,
             'current_image_id': current_image_id,
             'current_version': current_version,
+            'running': current_info.get('running'),
+            'health': current_info.get('health'),
             'last_checked_at': now
         })
 
@@ -1968,6 +2004,8 @@ class WatchtowerMonitor:
         if refreshed_info:
             new_state['current_image_id'] = refreshed_info.get('image_id', current_image_id)
             new_state['current_version'] = self.docker._format_version_info(refreshed_info, container)
+            new_state['running'] = refreshed_info.get('running')
+            new_state['health'] = refreshed_info.get('health')
 
         if update_result.get('busy'):
             logger.info(f'容器 {container} 正在被其他任务处理，本轮跳过自动更新')
@@ -2219,8 +2257,14 @@ def main():
     monitor = WatchtowerMonitor(bot, docker, config, health)
     resolved_mode = monitor._resolve_mode()
 
-    bot_poller = BotPoller(handler, bot, coordinator, health)
-    bot_poller.start()
+    if PRIMARY_SERVER:
+        bot_poller = BotPoller(handler, bot, coordinator, health)
+        bot_poller.start()
+    else:
+        health.beat('bot_poller', status='disabled', details={'primary_server': False})
+
+    remote_worker = RemoteCommandWorker(handler, handler.command_queue, SERVER_NAME, health)
+    remote_worker.start()
 
     heartbeat = HeartbeatThread(registry, health)
     heartbeat.start()

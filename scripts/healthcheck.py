@@ -9,7 +9,8 @@ import time
 from pathlib import Path
 
 MAX_AGE = int(os.getenv('HEALTHCHECK_MAX_AGE', '120'))
-REQUIRED_COMPONENTS = ('main', 'bot_poller', 'heartbeat', 'update_monitor')
+PRIMARY_SERVER = os.getenv('PRIMARY_SERVER', 'false').lower() == 'true'
+REQUIRED_COMPONENTS = ('main', 'heartbeat', 'update_monitor', 'remote_worker') + (( 'bot_poller',) if PRIMARY_SERVER else tuple())
 
 
 def sanitize_file_component(value: str) -> str:

@@ -73,6 +73,7 @@ services:
     environment:
       - SERVER_NAME=${SERVER_NAME:-My_Server_Name}
       - PRIMARY_SERVER=${PRIMARY_SERVER:-false}
+      - ENABLE_BOT_POLLING=${ENABLE_BOT_POLLING:-true}
       - UPDATE_SOURCE=${UPDATE_SOURCE:-auto}
       - AUTO_UPDATE=${AUTO_UPDATE:-true}
       - NOTIFY_ON_AVAILABLE_UPDATE=${NOTIFY_ON_AVAILABLE_UPDATE:-true}
@@ -104,6 +105,7 @@ CHAT_ID=你的_chat_id
 # 服务器信息
 SERVER_NAME=我的服务器
 PRIMARY_SERVER=false
+ENABLE_BOT_POLLING=true
 
 # 更新检测设置
 POLL_INTERVAL=1800
@@ -292,6 +294,7 @@ services:
     environment:
       - SERVER_NAME=${SERVER_NAME:-My_Server_Name}
       - PRIMARY_SERVER=${PRIMARY_SERVER:-false}
+      - ENABLE_BOT_POLLING=${ENABLE_BOT_POLLING:-true}
       - UPDATE_SOURCE=${UPDATE_SOURCE:-auto}
       - AUTO_UPDATE=${AUTO_UPDATE:-true}
       - NOTIFY_ON_AVAILABLE_UPDATE=${NOTIFY_ON_AVAILABLE_UPDATE:-true}
@@ -336,6 +339,7 @@ services:
     environment:
       - SERVER_NAME=${SERVER_NAME:-My_Server_Name}
       - PRIMARY_SERVER=${PRIMARY_SERVER:-false}
+      - ENABLE_BOT_POLLING=${ENABLE_BOT_POLLING:-true}
       - UPDATE_SOURCE=${UPDATE_SOURCE:-auto}
       - AUTO_UPDATE=${AUTO_UPDATE:-true}
       - NOTIFY_ON_AVAILABLE_UPDATE=${NOTIFY_ON_AVAILABLE_UPDATE:-true}

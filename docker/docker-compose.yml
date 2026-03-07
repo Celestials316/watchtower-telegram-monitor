@@ -11,6 +11,7 @@ services:
     environment:
       - SERVER_NAME=${SERVER_NAME:-My_Server_Name}
       - PRIMARY_SERVER=${PRIMARY_SERVER:-false}
+      - ENABLE_BOT_POLLING=${ENABLE_BOT_POLLING:-true}
       - UPDATE_SOURCE=${UPDATE_SOURCE:-auto}
       - AUTO_UPDATE=${AUTO_UPDATE:-true}
       - NOTIFY_ON_AVAILABLE_UPDATE=${NOTIFY_ON_AVAILABLE_UPDATE:-true}
