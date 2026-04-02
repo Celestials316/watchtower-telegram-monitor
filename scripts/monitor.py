@@ -535,6 +535,75 @@ class TelegramBot:
 
 class DockerManager:
     @staticmethod
+    def _shorten_message(message: str, limit: int = 300) -> str:
+        message = (message or '').strip()
+        if len(message) <= limit:
+            return message
+        return message[:limit]
+
+    @staticmethod
+    def classify_pull_error(image: str, raw_message: str) -> Dict[str, Any]:
+        raw_message = (raw_message or '').strip()
+        normalized = ' '.join(raw_message.split())
+        lowered = normalized.lower()
+        image_name = image.split(':')[0]
+        registry_error = 'registry-1.docker.io' in lowered or 'docker.io' in lowered
+
+        if 'tls: failed to verify certificate' in lowered and 'facebook.com' in lowered:
+            return {
+                'message': (
+                    f'访问 Docker Hub 时遭遇 TLS 证书异常，疑似网络劫持或 DNS/代理污染。'
+                    f' 目标镜像: {image_name}。原始错误: {DockerManager._shorten_message(normalized, 220)}'
+                ),
+                'error_key': 'dockerhub_tls_cert_mismatch',
+                'is_global': True,
+                'is_retryable': True,
+            }
+
+        if registry_error and any(token in lowered for token in [
+            'tls: failed to verify certificate',
+            'x509:',
+            'certificate verify failed',
+        ]):
+            return {
+                'message': (
+                    f'Docker Hub TLS 校验失败，可能是本机网络、DNS 或中间代理异常。'
+                    f' 目标镜像: {image_name}。原始错误: {DockerManager._shorten_message(normalized, 220)}'
+                ),
+                'error_key': 'dockerhub_tls_error',
+                'is_global': True,
+                'is_retryable': True,
+            }
+
+        if registry_error and any(token in lowered for token in [
+            'host is unreachable',
+            'i/o timeout',
+            'timed out',
+            'timeout',
+            'connection refused',
+            'temporary failure',
+            'no route to host',
+            'dial tcp',
+            'context deadline exceeded',
+        ]):
+            return {
+                'message': (
+                    f'Docker Hub 连通性异常，暂时无法检查镜像更新。'
+                    f' 目标镜像: {image_name}。原始错误: {DockerManager._shorten_message(normalized, 220)}'
+                ),
+                'error_key': 'dockerhub_connectivity_error',
+                'is_global': True,
+                'is_retryable': True,
+            }
+
+        return {
+            'message': DockerManager._shorten_message(normalized or '拉取失败'),
+            'error_key': '',
+            'is_global': False,
+            'is_retryable': False,
+        }
+
+    @staticmethod
     def _run(command: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
         return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
 
@@ -624,13 +693,32 @@ class DockerManager:
             'success': False,
             'image': image,
             'image_id': '',
-            'message': ''
+            'message': '',
+            'error_key': '',
+            'is_global_error': False,
         }
 
         try:
-            pull_result = DockerManager._run(['docker', 'pull', image], timeout=timeout)
-            if pull_result.returncode != 0:
-                result['message'] = (pull_result.stderr or pull_result.stdout or '拉取失败')[:300]
+            attempts = 3
+            for attempt in range(1, attempts + 1):
+                pull_result = DockerManager._run(['docker', 'pull', image], timeout=timeout)
+                if pull_result.returncode == 0:
+                    break
+
+                raw_message = pull_result.stderr or pull_result.stdout or '拉取失败'
+                classified = DockerManager.classify_pull_error(image, raw_message)
+                result['message'] = classified['message']
+                result['error_key'] = classified['error_key']
+                result['is_global_error'] = classified['is_global']
+
+                if classified['is_retryable'] and attempt < attempts:
+                    logger.warning(
+                        f'拉取镜像失败，准备重试 {attempt}/{attempts - 1}: '
+                        f'{image} -> {classified["message"]}'
+                    )
+                    time.sleep(min(5 * attempt, 15))
+                    continue
+
                 return result
 
             result['image_id'] = DockerManager.get_image_id(image)
@@ -642,9 +730,11 @@ class DockerManager:
             return result
         except subprocess.TimeoutExpired:
             result['message'] = '拉取镜像超时'
+            result['error_key'] = 'pull_timeout'
             return result
         except Exception as e:
             result['message'] = f'拉取镜像异常: {str(e)[:200]}'
+            result['error_key'] = 'pull_exception'
             return result
 
     @staticmethod
@@ -1791,6 +1881,7 @@ class WatchtowerMonitor:
         self.health = health_reporter
         self.session_data = {}
         self.state_store = UpdateStateManager(UPDATE_STATE_FILE, bot.server_name)
+        self._cycle_global_error_signatures: Set[str] = set()
 
     def _publish_local_inventory(self):
         containers = sorted(self.docker.get_all_containers())
@@ -1915,6 +2006,7 @@ class WatchtowerMonitor:
                 sleep_left -= step
 
     def _run_independent_check_cycle(self):
+        self._cycle_global_error_signatures = set()
         containers = sorted(
             container for container in self.docker.get_all_containers()
             if self.config.is_monitored(container)
@@ -2018,11 +2110,21 @@ class WatchtowerMonitor:
 
         pull_result = self.docker.pull_image(image)
         if not pull_result['success']:
+            is_global_error = bool(pull_result.get('is_global_error'))
+            error_key = pull_result.get('error_key') or ''
             error_signature = f"{image}:{pull_result['message']}"[:300]
-            if error_signature != state.get('last_error_signature'):
+            global_signature = f"{error_key}:{pull_result['message']}"[:300] if is_global_error else ''
+
+            should_notify = error_signature != state.get('last_error_signature')
+            if is_global_error and global_signature in self._cycle_global_error_signatures:
+                should_notify = False
+
+            if should_notify:
                 self._send_check_error_notification(container, image, pull_result['message'])
                 new_state['last_error_signature'] = error_signature
                 new_state['last_error_notified_at'] = now
+                if is_global_error and global_signature:
+                    self._cycle_global_error_signatures.add(global_signature)
             self.state_store.set_container_state(container, new_state)
             return
 
