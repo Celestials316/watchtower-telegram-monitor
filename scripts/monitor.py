@@ -25,6 +25,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN')}"
 CHAT_ID = os.getenv('CHAT_ID')
 SERVER_NAME = os.getenv('SERVER_NAME')
 PRIMARY_SERVER = os.getenv('PRIMARY_SERVER', 'false').lower() == 'true'
+ENABLE_BOT_POLLING = os.getenv('ENABLE_BOT_POLLING', 'true').lower() == 'true'
 ENABLE_ROLLBACK = os.getenv('ENABLE_ROLLBACK', 'true').lower() == 'true'
 CLEANUP_OLD_IMAGES = os.getenv('CLEANUP', 'true').lower() == 'true'
 AUTO_UPDATE = os.getenv('AUTO_UPDATE', 'true').lower() == 'true'
@@ -33,6 +34,7 @@ UPDATE_SOURCE = os.getenv('UPDATE_SOURCE', 'auto').strip().lower()
 CHECK_INTERVAL = max(int(os.getenv('POLL_INTERVAL', '1800') or '1800'), 30)
 INITIAL_CHECK_DELAY = max(int(os.getenv('INITIAL_CHECK_DELAY', '15') or '15'), 0)
 UPDATE_RETRY_BACKOFF = max(int(os.getenv('UPDATE_RETRY_BACKOFF', '1800') or '1800'), 60)
+REMOTE_JOB_PROCESSING_TIMEOUT = max(int(os.getenv('REMOTE_JOB_PROCESSING_TIMEOUT', '900') or '900'), 60)
 
 if UPDATE_SOURCE not in {'auto', 'independent', 'watchtower'}:
     UPDATE_SOURCE = 'independent'
@@ -342,11 +344,24 @@ class RemoteCommandQueue:
 
         def updater(data: Dict) -> Dict:
             jobs = data.setdefault('jobs', [])
+            now = time.time()
             for job in jobs:
-                if job.get('target_server') != target_server or job.get('status') != 'pending':
+                if job.get('target_server') != target_server:
+                    continue
+                status = job.get('status')
+                claimed_at = float(job.get('claimed_at', 0) or 0)
+                is_stale_processing = (
+                    status == 'processing'
+                    and claimed_at > 0
+                    and now - claimed_at > REMOTE_JOB_PROCESSING_TIMEOUT
+                )
+                if status != 'pending' and not is_stale_processing:
                     continue
                 job['status'] = 'processing'
-                job['claimed_at'] = time.time()
+                job['claimed_at'] = now
+                job['attempts'] = int(job.get('attempts', 0) or 0) + 1
+                if is_stale_processing:
+                    job['reclaimed_at'] = now
                 claimed.update(job)
                 break
             return data
@@ -366,6 +381,27 @@ class RemoteCommandQueue:
                     break
             cutoff = time.time() - 3600
             data['jobs'] = [job for job in jobs if not (job.get('status') == 'done' and job.get('completed_at', 0) < cutoff)]
+            return data
+
+        safe_update_json(self.queue_file, updater, default={})
+
+    def fail(self, job_id: str, error: str):
+        def updater(data: Dict) -> Dict:
+            jobs = data.setdefault('jobs', [])
+            for job in jobs:
+                if job.get('id') == job_id:
+                    job['status'] = 'failed'
+                    job['completed_at'] = time.time()
+                    job['error'] = (error or '未知错误')[:300]
+                    break
+            cutoff = time.time() - 86400
+            data['jobs'] = [
+                job for job in jobs
+                if not (
+                    job.get('status') in {'done', 'failed'}
+                    and job.get('completed_at', 0) < cutoff
+                )
+            ]
             return data
 
         safe_update_json(self.queue_file, updater, default={})
@@ -675,6 +711,75 @@ class DockerManager:
         return {}
 
     @staticmethod
+    def get_compose_metadata(container_config: Dict) -> Optional[Dict[str, Any]]:
+        labels = ((container_config.get('Config') or {}).get('Labels') or {})
+        project = labels.get('com.docker.compose.project')
+        service = labels.get('com.docker.compose.service')
+        if not project or not service:
+            return None
+
+        working_dir = (labels.get('com.docker.compose.project.working_dir') or '').strip()
+        raw_config_files = (labels.get('com.docker.compose.project.config_files') or '').strip()
+        config_files = []
+        for raw_path in raw_config_files.split(','):
+            normalized = raw_path.strip()
+            if not normalized:
+                continue
+            path = Path(normalized)
+            if not path.is_absolute() and working_dir:
+                path = Path(working_dir) / path
+            config_files.append(str(path))
+
+        return {
+            'project': project,
+            'service': service,
+            'working_dir': working_dir,
+            'config_files': config_files,
+            'oneoff': str(labels.get('com.docker.compose.oneoff', 'false')).lower() == 'true',
+        }
+
+    @staticmethod
+    def build_compose_command(compose_metadata: Dict[str, Any], args: List[str]) -> List[str]:
+        command = ['docker', 'compose']
+        project = compose_metadata.get('project')
+        working_dir = compose_metadata.get('working_dir')
+        if project:
+            command.extend(['--project-name', project])
+        if working_dir:
+            command.extend(['--project-directory', working_dir])
+        for config_file in compose_metadata.get('config_files', []):
+            command.extend(['-f', config_file])
+        command.extend(args)
+        return command
+
+    @staticmethod
+    def validate_compose_metadata(compose_metadata: Dict[str, Any]) -> Optional[str]:
+        if compose_metadata.get('oneoff'):
+            return '暂不支持更新一次性 Compose 容器'
+
+        missing_files = [
+            config_file for config_file in compose_metadata.get('config_files', [])
+            if not Path(config_file).exists()
+        ]
+        if missing_files:
+            return f'Compose 配置文件不存在: {", ".join(missing_files)}'
+
+        if not compose_metadata.get('service'):
+            return '缺少 Compose service 元数据'
+
+        return None
+
+    @staticmethod
+    def cleanup_image_if_unused(image_ref: str, keep_image_ids: Optional[Set[str]] = None):
+        protected = {image_id for image_id in (keep_image_ids or set()) if image_id}
+        if not image_ref or image_ref in protected:
+            return
+
+        result = DockerManager._run(['docker', 'image', 'rm', image_ref], timeout=20)
+        if result.returncode != 0:
+            logger.debug(f'清理镜像失败或镜像仍在使用: {image_ref}')
+
+    @staticmethod
     def get_image_id(image: str) -> str:
         try:
             result = DockerManager._run(
@@ -966,9 +1071,19 @@ class DockerManager:
                 result['message'] = '无法获取容器配置'
                 return result
 
+            compose_metadata = DockerManager.get_compose_metadata(config)
             image = old_info['image']
             old_image_id = old_info['image_id']
             result['old_version'] = DockerManager._format_version_info(old_info, container)
+
+            if compose_metadata:
+                return DockerManager._update_compose_container(
+                    container,
+                    config,
+                    old_info,
+                    compose_metadata,
+                    progress_callback
+                )
 
             if ENABLE_ROLLBACK:
                 safe_container = sanitize_file_component(container.lower())
@@ -1049,6 +1164,106 @@ class DockerManager:
 
             if result.get('success') and CLEANUP_OLD_IMAGES and old_image_id:
                 DockerManager._run(['docker', 'image', 'rm', old_image_id], timeout=20)
+
+    @staticmethod
+    def _update_compose_container(container: str, container_config: Dict, old_info: Dict,
+                                  compose_metadata: Dict[str, Any], progress_callback=None) -> Dict:
+        result = {
+            'success': False,
+            'message': '',
+            'old_version': DockerManager._format_version_info(old_info, container),
+            'new_version': ''
+        }
+
+        validation_error = DockerManager.validate_compose_metadata(compose_metadata)
+        if validation_error:
+            result['message'] = validation_error
+            return result
+
+        image = old_info['image']
+        old_image_id = old_info['image_id']
+        new_image_id = ''
+
+        def rollback_compose_service(reason: str) -> str:
+            if not ENABLE_ROLLBACK:
+                return reason
+
+            logger.warning(f'Compose 更新失败，准备自动回滚容器 {container}')
+            if progress_callback:
+                progress_callback('↩️ 更新失败，正在通过 Compose 自动回滚...')
+
+            tag_result = DockerManager._run(['docker', 'image', 'tag', old_image_id, image], timeout=20)
+            if tag_result.returncode != 0:
+                rollback_message = (tag_result.stderr or tag_result.stdout or '未知错误')[:200]
+                return f'{reason}；自动回滚失败: {rollback_message}'
+
+            rollback_cmd = DockerManager.build_compose_command(
+                compose_metadata,
+                ['up', '-d', '--no-deps', '--force-recreate', compose_metadata['service']]
+            )
+            rollback_result = DockerManager._run(rollback_cmd, timeout=180)
+            if rollback_result.returncode == 0 and DockerManager.wait_container_ready(container, timeout=90):
+                DockerManager.cleanup_image_if_unused(new_image_id, keep_image_ids={old_image_id})
+                return f'{reason}；已自动回滚到旧镜像'
+
+            rollback_message = (rollback_result.stderr or rollback_result.stdout or '未知错误')[:200]
+            return f'{reason}；自动回滚失败: {rollback_message}'
+
+        try:
+            if progress_callback:
+                progress_callback(f'🔄 正在通过 Compose 拉取镜像: {image}')
+
+            pull_cmd = DockerManager.build_compose_command(
+                compose_metadata,
+                ['pull', compose_metadata['service']]
+            )
+            pull_result = DockerManager._run(pull_cmd, timeout=300)
+            if pull_result.returncode != 0:
+                result['message'] = f"拉取 Compose 镜像失败: {(pull_result.stderr or pull_result.stdout)[:200]}"
+                return result
+
+            new_image_id = DockerManager.get_image_id(image)
+            if not new_image_id:
+                result['message'] = '拉取成功，但无法读取最新镜像 ID'
+                return result
+
+            if new_image_id == old_image_id:
+                result['success'] = True
+                result['new_version'] = result['old_version']
+                result['message'] = '镜像已是最新版本，无需更新'
+                return result
+
+            if progress_callback:
+                progress_callback('🚀 正在通过 Compose 重建服务...')
+
+            up_cmd = DockerManager.build_compose_command(
+                compose_metadata,
+                ['up', '-d', '--no-deps', '--force-recreate', compose_metadata['service']]
+            )
+            up_result = DockerManager._run(up_cmd, timeout=180)
+            if up_result.returncode != 0:
+                result['message'] = rollback_compose_service(
+                    f"Compose 重建服务失败: {(up_result.stderr or up_result.stdout)[:200]}"
+                )
+                return result
+
+            if DockerManager.wait_container_ready(container, timeout=90):
+                new_info = DockerManager.get_container_info(container)
+                result['new_version'] = DockerManager._format_version_info(new_info or {
+                    'image': image,
+                    'image_id': new_image_id
+                }, container)
+                result['success'] = True
+                result['message'] = '容器更新成功'
+            else:
+                result['message'] = rollback_compose_service('容器启动失败，请检查日志')
+
+            return result
+        finally:
+            if result.get('success') and CLEANUP_OLD_IMAGES and old_image_id:
+                DockerManager.cleanup_image_if_unused(old_image_id, keep_image_ids={new_image_id})
+            elif not result.get('success'):
+                DockerManager.cleanup_image_if_unused(new_image_id, keep_image_ids={old_image_id})
 
     @staticmethod
     def _format_version_info(info: Dict, container: str) -> str:
@@ -1579,6 +1794,28 @@ class CommandHandler:
             self._execute_update(chat_id, message_id, server, container)
         elif action == 'confirm_restart' and container:
             self._execute_restart(chat_id, message_id, server, container)
+        else:
+            raise ValueError(f'不支持的远程任务: {action}')
+
+    def notify_remote_job_failure(self, job: Dict, error: str):
+        payload = job.get('payload', {})
+        chat_id = str(payload.get('chat_id', ''))
+        message_id = str(payload.get('message_id', ''))
+        server = payload.get('server', self.bot.server_name)
+        container = payload.get('container', '')
+        if not chat_id or not message_id:
+            return
+
+        failure_msg = f"""❌ <b>远程任务执行失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+🖥️ 服务器: <code>{escape_html(server)}</code>
+📦 容器: <code>{escape_html(container or '未知')}</code>
+
+❌ <b>错误信息</b>
+  {escape_html((error or '未知错误')[:300])}
+━━━━━━━━━━━━━━━━━━━━"""
+        self.bot.edit_message(chat_id, message_id, failure_msg)
 
     def _enqueue_remote_action(self, action: str, server: str, container: str, chat_id: str, message_id: str):
         job_id = self.command_queue.enqueue(server, action, {
@@ -1752,8 +1989,15 @@ class RemoteCommandWorker(threading.Thread):
                 if not job:
                     time.sleep(1)
                     continue
-                self.handler.process_remote_job(job)
-                self.queue.complete(job['id'])
+                try:
+                    self.handler.process_remote_job(job)
+                    self.queue.complete(job['id'])
+                except Exception as e:
+                    self.queue.fail(job['id'], str(e))
+                    self.handler.notify_remote_job_failure(job, str(e))
+                    self.health.fail('remote_worker', e)
+                    logger.error(f'远程命令处理失败: {e}')
+                    time.sleep(2)
             except Exception as e:
                 self.health.fail('remote_worker', e)
                 logger.error(f'远程命令处理失败: {e}')
@@ -2155,11 +2399,13 @@ class WatchtowerMonitor:
                 new_state['last_notified_available_image_id'] = latest_image_id
                 new_state['last_notified_available_at'] = now
             self.state_store.set_container_state(container, new_state)
+            DockerManager.cleanup_image_if_unused(latest_image_id, keep_image_ids={current_image_id})
             return
 
         last_attempt_at = float(state.get('last_attempt_at', 0) or 0)
         if latest_image_id == state.get('last_failed_target_image_id') and now - last_attempt_at < UPDATE_RETRY_BACKOFF:
             self.state_store.set_container_state(container, new_state)
+            DockerManager.cleanup_image_if_unused(latest_image_id, keep_image_ids={current_image_id})
             return
 
         logger.info(f'检测到容器 {container} 存在新版本，开始自动更新')
@@ -2208,6 +2454,10 @@ class WatchtowerMonitor:
                 )
                 new_state['last_notified_failure_image_id'] = latest_image_id
                 new_state['last_failure_notified_at'] = time.time()
+            DockerManager.cleanup_image_if_unused(
+                latest_image_id,
+                keep_image_ids={new_state.get('current_image_id'), current_image_id}
+            )
 
         self.state_store.set_container_state(container, new_state)
 
@@ -2425,11 +2675,14 @@ def main():
 
     handler = CommandHandler(bot, docker, config, registry)
 
-    if PRIMARY_SERVER:
+    if PRIMARY_SERVER and ENABLE_BOT_POLLING:
         bot_poller = BotPoller(handler, bot, coordinator, health)
         bot_poller.start()
     else:
-        health.beat('bot_poller', status='disabled', details={'primary_server': False})
+        health.beat('bot_poller', status='disabled', details={
+            'primary_server': PRIMARY_SERVER,
+            'enabled': ENABLE_BOT_POLLING
+        })
 
     remote_worker = RemoteCommandWorker(handler, handler.command_queue, SERVER_NAME, health)
     remote_worker.start()

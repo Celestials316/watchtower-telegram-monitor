@@ -10,7 +10,10 @@ from pathlib import Path
 
 MAX_AGE = int(os.getenv('HEALTHCHECK_MAX_AGE', '120'))
 PRIMARY_SERVER = os.getenv('PRIMARY_SERVER', 'false').lower() == 'true'
-REQUIRED_COMPONENTS = ('main', 'heartbeat', 'update_monitor', 'remote_worker') + (('bot_poller',) if PRIMARY_SERVER else tuple())
+ENABLE_BOT_POLLING = os.getenv('ENABLE_BOT_POLLING', 'true').lower() == 'true'
+REQUIRED_COMPONENTS = ('main', 'heartbeat', 'update_monitor', 'remote_worker') + (
+    ('bot_poller',) if PRIMARY_SERVER and ENABLE_BOT_POLLING else tuple()
+)
 LIFECYCLE_COMPONENTS = ('main',)
 
 
