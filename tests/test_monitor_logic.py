@@ -108,6 +108,58 @@ class MonitorLogicTests(unittest.TestCase):
                     queue.enqueue("srv-a", "confirm_update", {"container": "demo"})
                 )
 
+    def test_remote_queue_claim_does_not_rewrite_empty_queue(self):
+        module = load_monitor_module()
+        with tempfile.TemporaryDirectory() as tempdir:
+            queue_path = Path(tempdir) / "queue.json"
+            queue_path.write_text(json.dumps({"jobs": []}), encoding="utf-8")
+            queue = module.RemoteCommandQueue(queue_path)
+
+            before = queue_path.stat().st_mtime_ns
+            time.sleep(0.01)
+            claimed = queue.claim("srv-a")
+            after = queue_path.stat().st_mtime_ns
+
+            self.assertIsNone(claimed)
+            self.assertEqual(before, after)
+            self.assertEqual(
+                json.loads(queue_path.read_text(encoding="utf-8")),
+                {"jobs": []},
+            )
+
+    def test_remote_queue_claim_does_not_rewrite_when_target_server_has_no_job(self):
+        module = load_monitor_module()
+        with tempfile.TemporaryDirectory() as tempdir:
+            queue_path = Path(tempdir) / "queue.json"
+            queue_path.write_text(
+                json.dumps(
+                    {
+                        "jobs": [
+                            {
+                                "id": "job-1",
+                                "target_server": "srv-b",
+                                "action": "confirm_update",
+                                "payload": {"container": "demo"},
+                                "status": "pending",
+                                "created_at": time.time(),
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            queue = module.RemoteCommandQueue(queue_path)
+
+            before = queue_path.stat().st_mtime_ns
+            original = queue_path.read_text(encoding="utf-8")
+            time.sleep(0.01)
+            claimed = queue.claim("srv-a")
+            after = queue_path.stat().st_mtime_ns
+
+            self.assertIsNone(claimed)
+            self.assertEqual(before, after)
+            self.assertEqual(queue_path.read_text(encoding="utf-8"), original)
+
     def test_notify_only_mode_cleans_up_pulled_image(self):
         module = load_monitor_module()
 

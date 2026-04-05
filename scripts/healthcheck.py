@@ -72,6 +72,16 @@ def ensure_process_alive(pid: int):
         raise RuntimeError(f'主进程不可用: {exc}') from exc
 
 
+def component_max_age(name: str, component: dict) -> int:
+    max_age = MAX_AGE
+    if name == 'update_monitor':
+        details = component.get('details', {}) if isinstance(component, dict) else {}
+        interval = details.get('interval')
+        if isinstance(interval, (int, float)) and interval > 0:
+            max_age = max(max_age, int(interval) + 60)
+    return max_age
+
+
 def main() -> int:
     try:
         data = load_health()
@@ -107,7 +117,8 @@ def main() -> int:
         if name in LIFECYCLE_COMPONENTS:
             continue
 
-        if now - component_updated_at > MAX_AGE:
+        allowed_age = component_max_age(name, component)
+        if now - component_updated_at > allowed_age:
             return fail(f'组件心跳超时: {name} {now - component_updated_at:.0f}s')
 
     print('ok')

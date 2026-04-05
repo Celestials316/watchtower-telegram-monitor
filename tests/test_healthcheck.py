@@ -74,6 +74,29 @@ class HealthcheckTests(unittest.TestCase):
         with mock.patch.object(module, "HEALTH_FILE", self.health_file):
             self.assertEqual(module.main(), 1)
 
+    def test_update_monitor_uses_reported_interval_before_timing_out(self):
+        module = load_healthcheck_module()
+        now = time.time()
+        self.write_health(
+            {
+                "pid": os.getpid(),
+                "updated_at": now,
+                "components": {
+                    "main": {"status": "running", "updated_at": now},
+                    "heartbeat": {"status": "ok", "updated_at": now},
+                    "update_monitor": {
+                        "status": "ok",
+                        "updated_at": now - 300,
+                        "details": {"interval": 1800},
+                    },
+                    "remote_worker": {"status": "ok", "updated_at": now},
+                },
+            }
+        )
+
+        with mock.patch.object(module, "HEALTH_FILE", self.health_file):
+            self.assertEqual(module.main(), 0)
+
     def test_primary_server_can_disable_bot_poller_requirement(self):
         module = load_healthcheck_module({
             "PRIMARY_SERVER": "true",

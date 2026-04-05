@@ -351,32 +351,54 @@ class RemoteCommandQueue:
     def claim(self, target_server: str) -> Optional[Dict]:
         claimed = {}
 
-        def updater(data: Dict) -> Dict:
-            jobs = data.setdefault('jobs', [])
-            now = time.time()
-            for job in jobs:
-                if job.get('target_server') != target_server:
-                    continue
-                status = job.get('status')
-                claimed_at = float(job.get('claimed_at', 0) or 0)
-                is_stale_processing = (
-                    status == 'processing'
-                    and claimed_at > 0
-                    and now - claimed_at > REMOTE_JOB_PROCESSING_TIMEOUT
-                )
-                if status != 'pending' and not is_stale_processing:
-                    continue
-                job['status'] = 'processing'
-                job['claimed_at'] = now
-                job['attempts'] = int(job.get('attempts', 0) or 0) + 1
-                if is_stale_processing:
-                    job['reclaimed_at'] = now
-                claimed.update(job)
-                break
-            return data
+        try:
+            with FileLock(self.queue_file, timeout=5):
+                data = {}
+                if self.queue_file.exists():
+                    with open(self.queue_file, 'r', encoding='utf-8') as f:
+                        content = f.read().strip()
+                        if content:
+                            data = json.loads(content)
 
-        safe_update_json(self.queue_file, updater, default={})
-        return claimed or None
+                jobs = data.setdefault('jobs', [])
+                now = time.time()
+                for job in jobs:
+                    if job.get('target_server') != target_server:
+                        continue
+                    status = job.get('status')
+                    claimed_at = float(job.get('claimed_at', 0) or 0)
+                    is_stale_processing = (
+                        status == 'processing'
+                        and claimed_at > 0
+                        and now - claimed_at > REMOTE_JOB_PROCESSING_TIMEOUT
+                    )
+                    if status != 'pending' and not is_stale_processing:
+                        continue
+                    job['status'] = 'processing'
+                    job['claimed_at'] = now
+                    job['attempts'] = int(job.get('attempts', 0) or 0) + 1
+                    if is_stale_processing:
+                        job['reclaimed_at'] = now
+                    claimed.update(job)
+                    break
+
+                if not claimed:
+                    return None
+
+                temp_path = self.queue_file.with_name(f'{self.queue_file.name}.{uuid.uuid4().hex}.tmp')
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                temp_path.replace(self.queue_file)
+        except (json.JSONDecodeError, TimeoutError) as e:
+            logger.error(f"远程任务领取失败: {self.queue_file} - {e}")
+            return None
+        except Exception as e:
+            logger.error(f"远程任务领取失败: {e}")
+            return None
+
+        return claimed
 
     def complete(self, job_id: str, error: Optional[str] = None):
         def updater(data: Dict) -> Dict:
