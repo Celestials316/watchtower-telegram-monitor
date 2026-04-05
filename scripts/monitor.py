@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 import requests
 from pathlib import Path
 
-VERSION = "5.3.3"
+VERSION = "5.3.4"
 TELEGRAM_API = f"https://api.telegram.org/bot{os.getenv('BOT_TOKEN')}"
 CHAT_ID = os.getenv('CHAT_ID')
 SERVER_NAME = os.getenv('SERVER_NAME')
@@ -309,7 +309,7 @@ class RemoteCommandQueue:
     def __init__(self, queue_file: Path):
         self.queue_file = queue_file
 
-    def enqueue(self, target_server: str, action: str, payload: Dict) -> str:
+    def enqueue(self, target_server: str, action: str, payload: Dict) -> Optional[str]:
         job_id = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
 
         def updater(data: Dict) -> Dict:
@@ -326,7 +326,16 @@ class RemoteCommandQueue:
             data['jobs'] = [job for job in jobs if job.get('created_at', 0) >= cutoff and job.get('status') != 'done']
             return data
 
-        safe_update_json(self.queue_file, updater, default={})
+        updated = safe_update_json(self.queue_file, updater, default={})
+        if updated is None:
+            logger.error(f'远程任务入队失败: {target_server} {action} -> {job_id}')
+            return None
+
+        jobs = updated.get('jobs', [])
+        if not any(job.get('id') == job_id for job in jobs):
+            logger.error(f'远程任务入队后未找到任务记录: {target_server} {action} -> {job_id}')
+            return None
+
         return job_id
 
     def count_pending(self, target_server: Optional[str] = None) -> int:
@@ -770,6 +779,11 @@ class DockerManager:
         return None
 
     @staticmethod
+    def should_fallback_from_compose(validation_error: Optional[str]) -> bool:
+        message = (validation_error or '').strip()
+        return bool(message) and message.startswith('Compose 配置文件不存在:')
+
+    @staticmethod
     def cleanup_image_if_unused(image_ref: str, keep_image_ids: Optional[Set[str]] = None):
         protected = {image_id for image_id in (keep_image_ids or set()) if image_id}
         if not image_ref or image_ref in protected:
@@ -911,6 +925,7 @@ class DockerManager:
         backup_tag = None
         config = {}
         old_image_id = ''
+        preserve_compose_labels = False
 
         def build_run_cmd(container_config: Dict, image_ref: str) -> List[str]:
             host_config = container_config.get('HostConfig', {})
@@ -954,7 +969,7 @@ class DockerManager:
 
             labels = config_section.get('Labels') or {}
             for key, value in labels.items():
-                if key.startswith('com.docker.compose.'):
+                if key.startswith('com.docker.compose.') and not preserve_compose_labels:
                     continue
                 run_cmd.extend(['--label', key if value in (None, '') else f'{key}={value}'])
 
@@ -1077,13 +1092,27 @@ class DockerManager:
             result['old_version'] = DockerManager._format_version_info(old_info, container)
 
             if compose_metadata:
-                return DockerManager._update_compose_container(
-                    container,
-                    config,
-                    old_info,
-                    compose_metadata,
-                    progress_callback
-                )
+                validation_error = DockerManager.validate_compose_metadata(compose_metadata)
+                if validation_error is None:
+                    return DockerManager._update_compose_container(
+                        container,
+                        config,
+                        old_info,
+                        compose_metadata,
+                        progress_callback
+                    )
+
+                if DockerManager.should_fallback_from_compose(validation_error):
+                    preserve_compose_labels = True
+                    logger.warning(
+                        f'Compose 元数据在当前监控容器内不可访问，回退到直接重建容器: '
+                        f'{container} -> {validation_error}'
+                    )
+                    if progress_callback:
+                        progress_callback('⚠️ Compose 配置当前不可访问，回退到直接重建容器...')
+                else:
+                    result['message'] = validation_error
+                    return result
 
             if ENABLE_ROLLBACK:
                 safe_container = sanitize_file_component(container.lower())
@@ -1824,6 +1853,20 @@ class CommandHandler:
             'chat_id': chat_id,
             'message_id': message_id
         })
+        if not job_id:
+            logger.error(f'远程任务提交失败: action={action} server={server} container={container}')
+            failure = f"""❌ <b>远程任务提交失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+🖥️ 目标服务器: <code>{escape_html(server)}</code>
+📦 容器: <code>{escape_html(container)}</code>
+
+❌ <b>错误信息</b>
+  共享任务队列写入失败，请稍后重试
+━━━━━━━━━━━━━━━━━━━━"""
+            self.bot.edit_message(chat_id, message_id, failure)
+            return
+
         waiting = '⏳ 已提交远程更新任务...' if action == 'confirm_update' else '⏳ 已提交远程重启任务...'
         waiting += f"\n\n🖥️ 目标服务器: <code>{escape_html(server)}</code>"
         waiting += f"\n📦 容器: <code>{escape_html(container)}</code>"

@@ -99,6 +99,15 @@ class MonitorLogicTests(unittest.TestCase):
             self.assertEqual(failed_data["jobs"][0]["status"], "failed")
             self.assertEqual(failed_data["jobs"][0]["error"], "boom")
 
+    def test_remote_queue_enqueue_returns_none_when_write_fails(self):
+        module = load_monitor_module()
+        with tempfile.TemporaryDirectory() as tempdir:
+            queue = module.RemoteCommandQueue(Path(tempdir) / "queue.json")
+            with mock.patch.object(module, "safe_update_json", return_value=None):
+                self.assertIsNone(
+                    queue.enqueue("srv-a", "confirm_update", {"container": "demo"})
+                )
+
     def test_notify_only_mode_cleans_up_pulled_image(self):
         module = load_monitor_module()
 
@@ -180,6 +189,70 @@ class MonitorLogicTests(unittest.TestCase):
         self.assertTrue(any(command[:2] == ["docker", "compose"] and "pull" in command for command in calls))
         self.assertTrue(any(command[:2] == ["docker", "compose"] and "up" in command for command in calls))
         self.assertFalse(any(command[:2] == ["docker", "run"] for command in calls))
+
+    def test_missing_compose_file_falls_back_to_direct_container_recreate(self):
+        module = load_monitor_module()
+        container_config = {
+            "Config": {
+                "Image": "demo:latest",
+                "Env": ["A=1"],
+                "Labels": {
+                    "com.docker.compose.project": "demo",
+                    "com.docker.compose.service": "web",
+                    "com.docker.compose.project.working_dir": "/opt/demo",
+                    "com.docker.compose.project.config_files": "/opt/demo/docker-compose.yml",
+                },
+            },
+            "HostConfig": {
+                "NetworkMode": "bridge",
+                "RestartPolicy": {},
+                "PortBindings": {},
+            },
+            "Mounts": [],
+        }
+        old_info = {
+            "image": "demo:latest",
+            "image_id": "sha256:old",
+            "running": True,
+            "health": None,
+        }
+
+        calls = []
+
+        def fake_run(command, timeout=30):
+            calls.append(command)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(module.DockerManager, "get_container_info", side_effect=[old_info, {
+            "image": "demo:latest",
+            "image_id": "sha256:new",
+            "running": True,
+            "health": None,
+        }]):
+            with mock.patch.object(module.DockerManager, "get_container_inspect", return_value=container_config):
+                with mock.patch.object(
+                    module.DockerManager,
+                    "validate_compose_metadata",
+                    return_value="Compose 配置文件不存在: /opt/demo/docker-compose.yml",
+                ):
+                    with mock.patch.object(module.DockerManager, "_run", side_effect=fake_run):
+                        with mock.patch.object(module.DockerManager, "pull_image", return_value={
+                            "success": True,
+                            "image_id": "sha256:new",
+                        }):
+                            with mock.patch.object(module.DockerManager, "wait_container_ready", return_value=True):
+                                with mock.patch.object(
+                                    module.DockerManager,
+                                    "_format_version_info",
+                                    side_effect=["latest (old)", "latest (new)"],
+                                ):
+                                    result = module.DockerManager._update_container_internal("web", None)
+
+        self.assertTrue(result["success"])
+        self.assertTrue(any(command[:2] == ["docker", "stop"] for command in calls))
+        self.assertTrue(any(command[:2] == ["docker", "rm"] for command in calls))
+        self.assertTrue(any(command[:2] == ["docker", "run"] for command in calls))
+        self.assertFalse(any(command[:2] == ["docker", "compose"] for command in calls))
 
 
 if __name__ == "__main__":
