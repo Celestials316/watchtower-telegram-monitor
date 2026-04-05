@@ -10,7 +10,8 @@ from pathlib import Path
 
 MAX_AGE = int(os.getenv('HEALTHCHECK_MAX_AGE', '120'))
 PRIMARY_SERVER = os.getenv('PRIMARY_SERVER', 'false').lower() == 'true'
-REQUIRED_COMPONENTS = ('main', 'heartbeat', 'update_monitor', 'remote_worker') + (( 'bot_poller',) if PRIMARY_SERVER else tuple())
+REQUIRED_COMPONENTS = ('main', 'heartbeat', 'update_monitor', 'remote_worker') + (('bot_poller',) if PRIMARY_SERVER else tuple())
+LIFECYCLE_COMPONENTS = ('main',)
 
 
 def sanitize_file_component(value: str) -> str:
@@ -99,6 +100,9 @@ def main() -> int:
 
         if status == 'error':
             return fail(f'组件异常: {name}')
+
+        if name in LIFECYCLE_COMPONENTS:
+            continue
 
         if now - component_updated_at > MAX_AGE:
             return fail(f'组件心跳超时: {name} {now - component_updated_at:.0f}s')
