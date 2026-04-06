@@ -159,9 +159,107 @@ docker compose logs watchtower-notifier | tail -20
 
 ## 多服务器部署
 
-多服务器需要共享数据以实现统一管理。支持两种方案：
+当前推荐使用 `SSH + Tailscale` 作为多服务器控制面，每台服务器都保留本地 `/data`，由主服务器通过 SSH 实时读取远程状态并执行更新/重启。旧的 NFS 共享状态方案仍然保留，适合兼容老部署，但不再作为首选。
 
-### 方案一：Tailscale 虚拟局域网（强烈推荐）
+### 方案一：SSH + Tailscale（推荐，默认）
+
+**优点：**
+- ✅ 不依赖共享 NFS，远程任务不会因为挂载卡死而整体阻塞
+- ✅ 主服务器直接读取远程实时状态，不再依赖共享 `command_queue.json`
+- ✅ 每台服务器保留本地 `data`，健康检查和自愈链路更稳
+- ✅ 仅需开放 Tailscale 内网，不必暴露公网 SSH
+
+#### 第一步：所有服务器安装 Tailscale
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+tailscale ip -4
+```
+
+记录主服务器和远程服务器的 Tailscale IP，后面写入 `REMOTE_SERVERS_JSON`。
+
+#### 第二步：主服务器生成 SSH 密钥
+
+```bash
+mkdir -p ~/watchtower/ssh
+cd ~/watchtower
+ssh-keygen -t ed25519 -f ./ssh/id_ed25519 -N ''
+chmod 600 ./ssh/id_ed25519
+```
+
+#### 第三步：把公钥分发到远程服务器
+
+```bash
+ssh-copy-id -i ./ssh/id_ed25519.pub root@100.64.1.20
+
+# 验证
+ssh -i ./ssh/id_ed25519 root@100.64.1.20 "hostname"
+```
+
+#### 第四步：配置主服务器 `.env`
+
+```bash
+BOT_TOKEN=你的_bot_token
+CHAT_ID=你的_chat_id
+SERVER_NAME=主服务器
+PRIMARY_SERVER=true
+ENABLE_BOT_POLLING=true
+REMOTE_CONTROL_MODE=auto
+REMOTE_SERVERS_JSON=[{"name":"云服务V2","transport":"ssh","host":"100.64.1.20","user":"root","port":22,"monitor_container":"watchtower-notifier","identity_file":"/ssh/id_ed25519"}]
+```
+
+说明：
+- `transport=ssh` 表示优先使用新方案。
+- 如果某台机器仍要沿用旧共享队列，可写成 `{"name":"旧节点","transport":"queue"}`。
+- `monitor_container` 要和远程机器实际的监控容器名一致。
+
+#### 第五步：主服务器 `docker-compose.yml`
+
+仓库内置的 `docker/docker-compose.yml` 已经包含：
+
+```yaml
+volumes:
+  - /var/run/docker.sock:/var/run/docker.sock:ro
+  - ./data:/data
+  - ./ssh:/ssh:ro
+environment:
+  - REMOTE_CONTROL_MODE=${REMOTE_CONTROL_MODE:-auto}
+  - REMOTE_SERVERS_JSON=${REMOTE_SERVERS_JSON:-[]}
+```
+
+直接拉起即可：
+
+```bash
+mkdir -p data ssh
+docker compose up -d
+```
+
+#### 第六步：远程服务器 `.env`
+
+```bash
+BOT_TOKEN=你的_bot_token
+CHAT_ID=你的_chat_id
+SERVER_NAME=云服务V2
+PRIMARY_SERVER=false
+ENABLE_BOT_POLLING=false
+REMOTE_CONTROL_MODE=auto
+```
+
+远程服务器继续使用本地 `./data`，不需要挂 NFS。启动后会负责本机更新检测，并作为 SSH RPC 目标节点被主服务器调用。
+
+#### 第七步：联通验证
+
+```bash
+# 宿主机验证 SSH
+ssh -i ./ssh/id_ed25519 root@100.64.1.20 "docker ps --format '{{.Names}}'"
+
+# 容器内验证 RPC
+docker exec watchtower-notifier ssh -i /ssh/id_ed25519 root@100.64.1.20 \
+  "docker exec watchtower-notifier python3 /app/monitor.py rpc inventory"
+```
+
+### 方案二：NFS 共享状态（兼容旧模式，基于 Tailscale）
 
 **优点：**
 - ✅ 配置简单（5分钟搞定）
@@ -440,7 +538,7 @@ docker compose logs -f watchtower-notifier
 
 ---
 
-### 方案二：公网 NFS
+### 方案三：公网 NFS（兼容旧模式）
 
 **适用场景：** 主服务器有公网 IP，其他服务器可直接访问
 
@@ -663,18 +761,15 @@ docker compose logs watchtower-notifier | tail -30
 ### 5. 多服务器验证
 
 ```bash
-# 查看共享数据
+# SSH/Tailscale 新方案
+docker exec watchtower-notifier ssh -i /ssh/id_ed25519 root@远程TailscaleIP \
+  "docker exec watchtower-notifier python3 /app/monitor.py rpc inventory"
+
+# 返回 JSON 即表示主服务器可以实时拿到远程状态
+
+# 如果还在使用旧 NFS 方案，再检查共享数据
 docker exec watchtower-notifier ls -la /data
-
-# 应该看到：
-# server_registry.json
-# monitor_config.json
-# health_status.<server>.json
-
-# 查看服务器注册表
 docker exec watchtower-notifier sh -c "cat /data/server_registry.json && echo && cat /data/update_state.json && echo && ls -la /data/health_status.*.json"
-
-# 应该看到所有服务器的心跳信息
 ```
 
 ---
@@ -704,9 +799,23 @@ curl "https://api.telegram.org/bot你的TOKEN/getMe"
 docker logs watchtower-notifier | grep -i error
 ```
 
-### 问题 2：NFS 连接失败（多服务器）
+### 问题 2：远程服务器不可达 / NFS 连接失败（多服务器）
 
-**Tailscale 方案：**
+**SSH + Tailscale 方案：**
+
+```bash
+# 检查 Tailscale
+sudo tailscale status
+
+# 检查 SSH
+ssh -i ./ssh/id_ed25519 root@100.64.1.20 "hostname"
+
+# 检查远程监控容器 RPC
+ssh -i ./ssh/id_ed25519 root@100.64.1.20 \
+  "docker exec watchtower-notifier python3 /app/monitor.py rpc inventory"
+```
+
+**旧 NFS 方案：**
 
 ```bash
 # 检查 Tailscale 状态
@@ -754,7 +863,11 @@ docker compose up -d
 ### 问题 4：多服务器数据不同步
 
 ```bash
-# 检查 NFS 挂载
+# SSH 新方案：检查远程实时 inventory
+docker exec watchtower-notifier ssh -i /ssh/id_ed25519 root@远程TailscaleIP \
+  "docker exec watchtower-notifier python3 /app/monitor.py rpc inventory"
+
+# 旧 NFS 方案：检查挂载
 docker exec watchtower-notifier df -h | grep data
 
 # 查看共享文件

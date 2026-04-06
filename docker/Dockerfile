@@ -7,6 +7,7 @@ LABEL maintainer="Celestials316" \
 RUN apk add --no-cache \
     docker-cli \
     curl \
+    openssh-client \
     tzdata \
     && rm -rf /var/cache/apk/*
 

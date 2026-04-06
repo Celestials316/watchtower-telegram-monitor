@@ -41,7 +41,8 @@ def resolve_health_file() -> Path:
 
     server_name = os.getenv('SERVER_NAME', 'default')
     server_key = sanitize_file_component(server_name)
-    return Path(f'/data/health_status.{server_key}.json')
+    data_dir = Path(os.getenv('DATA_DIR', '/data'))
+    return data_dir / f'health_status.{server_key}.json'
 
 
 HEALTH_FILE = resolve_health_file()

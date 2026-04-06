@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -160,6 +161,111 @@ class MonitorLogicTests(unittest.TestCase):
             self.assertEqual(before, after)
             self.assertEqual(queue_path.read_text(encoding="utf-8"), original)
 
+    def test_parse_remote_servers_config_preserves_ssh_and_queue_modes(self):
+        remote_servers = json.dumps(
+            [
+                {
+                    "name": "srv-ssh",
+                    "transport": "ssh",
+                    "host": "100.64.0.10",
+                    "user": "root",
+                    "monitor_container": "watchtower-notifier-154",
+                },
+                {
+                    "name": "srv-queue",
+                    "transport": "queue",
+                },
+            ]
+        )
+        module = load_monitor_module({"REMOTE_SERVERS_JSON": remote_servers})
+
+        self.assertEqual(module.REMOTE_SERVER_CONFIGS["srv-ssh"]["transport"], "ssh")
+        self.assertEqual(module.REMOTE_SERVER_CONFIGS["srv-ssh"]["host"], "100.64.0.10")
+        self.assertEqual(
+            module.REMOTE_SERVER_CONFIGS["srv-ssh"]["monitor_container"],
+            "watchtower-notifier-154",
+        )
+        self.assertEqual(module.REMOTE_SERVER_CONFIGS["srv-queue"]["transport"], "queue")
+
+    def test_remote_server_controller_fetches_inventory_via_ssh(self):
+        remote_servers = json.dumps(
+            [
+                {
+                    "name": "srv-ssh",
+                    "transport": "ssh",
+                    "host": "100.64.0.10",
+                    "user": "root",
+                }
+            ]
+        )
+        module = load_monitor_module({"REMOTE_SERVERS_JSON": remote_servers})
+        docker = mock.Mock()
+        config = mock.Mock()
+        registry = mock.Mock()
+        registry.get_active_servers.return_value = []
+        registry.registry_file = Path("/tmp/server_registry.json")
+        controller = module.RemoteServerController("local", docker, config, registry)
+
+        with mock.patch.object(
+            controller,
+            "_run_remote_rpc",
+            return_value={
+                "ok": True,
+                "server_name": "srv-ssh",
+                "mode": "independent",
+                "collected_at": 123.0,
+                "total_containers": 1,
+                "monitored_containers": ["demo"],
+                "excluded_containers": [],
+                "containers": {"demo": {"running": True}},
+            },
+        ) as rpc_mock:
+            inventory = controller.get_inventory("srv-ssh", force_refresh=True)
+
+        rpc_mock.assert_called_once_with("srv-ssh", "inventory", timeout=60)
+        self.assertEqual(inventory["transport"], "ssh")
+        self.assertEqual(inventory["monitored_containers"], ["demo"])
+
+    def test_enqueue_remote_action_uses_ssh_when_configured(self):
+        remote_servers = json.dumps(
+            [
+                {
+                    "name": "srv-ssh",
+                    "transport": "ssh",
+                    "host": "100.64.0.10",
+                    "user": "root",
+                }
+            ]
+        )
+        module = load_monitor_module({"REMOTE_SERVERS_JSON": remote_servers})
+        bot = mock.Mock()
+        bot.server_name = "local"
+        docker = mock.Mock()
+        config = mock.Mock()
+        registry = mock.Mock()
+        registry.get_active_servers.return_value = []
+        registry.registry_file = Path("/tmp/server_registry.json")
+        handler = module.CommandHandler(bot, docker, config, registry)
+
+        with mock.patch.object(handler, "_run_async") as async_mock:
+            handler._enqueue_remote_action(
+                "confirm_update",
+                "srv-ssh",
+                "demo",
+                "1",
+                "2",
+            )
+
+        bot.edit_message.assert_called()
+        async_mock.assert_called_once_with(
+            handler._execute_remote_action_via_ssh,
+            "confirm_update",
+            "1",
+            "2",
+            "srv-ssh",
+            "demo",
+        )
+
     def test_notify_only_mode_cleans_up_pulled_image(self):
         module = load_monitor_module()
 
@@ -305,6 +411,32 @@ class MonitorLogicTests(unittest.TestCase):
         self.assertTrue(any(command[:2] == ["docker", "rm"] for command in calls))
         self.assertTrue(any(command[:2] == ["docker", "run"] for command in calls))
         self.assertFalse(any(command[:2] == ["docker", "compose"] for command in calls))
+
+    def test_run_rpc_inventory_emits_json_payload(self):
+        module = load_monitor_module()
+        inventory_payload = {
+            "ok": True,
+            "server_name": "test-server",
+            "transport": "local",
+            "mode": "independent",
+            "collected_at": 123.0,
+            "total_containers": 1,
+            "monitored_containers": ["demo"],
+            "excluded_containers": [],
+            "static_monitored_containers": [],
+            "containers": {"demo": {"running": True}},
+        }
+
+        with mock.patch.object(module, "build_inventory_payload", return_value=inventory_payload):
+            with mock.patch.object(module, "resolve_update_mode", return_value="independent"):
+                stdout = io.StringIO()
+                with mock.patch("sys.stdout", stdout):
+                    exit_code = module.run_rpc(["inventory"])
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue().strip())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["server_name"], "test-server")
 
 
 if __name__ == "__main__":

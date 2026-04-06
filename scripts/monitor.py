@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import os
 import sys
 import json
@@ -35,11 +36,18 @@ CHECK_INTERVAL = max(int(os.getenv('POLL_INTERVAL', '1800') or '1800'), 30)
 INITIAL_CHECK_DELAY = max(int(os.getenv('INITIAL_CHECK_DELAY', '15') or '15'), 0)
 UPDATE_RETRY_BACKOFF = max(int(os.getenv('UPDATE_RETRY_BACKOFF', '1800') or '1800'), 60)
 REMOTE_JOB_PROCESSING_TIMEOUT = max(int(os.getenv('REMOTE_JOB_PROCESSING_TIMEOUT', '900') or '900'), 60)
+REMOTE_CONTROL_MODE = os.getenv('REMOTE_CONTROL_MODE', 'auto').strip().lower()
+SSH_CONNECT_TIMEOUT = max(int(os.getenv('SSH_CONNECT_TIMEOUT', '15') or '15'), 5)
+SSH_COMMAND_TIMEOUT = max(int(os.getenv('SSH_COMMAND_TIMEOUT', '300') or '300'), 30)
+REMOTE_CACHE_TTL = max(int(os.getenv('REMOTE_CACHE_TTL', '15') or '15'), 5)
 
 if UPDATE_SOURCE not in {'auto', 'independent', 'watchtower'}:
     UPDATE_SOURCE = 'independent'
 
-DATA_DIR = Path("/data")
+if REMOTE_CONTROL_MODE not in {'auto', 'ssh', 'queue'}:
+    REMOTE_CONTROL_MODE = 'auto'
+
+DATA_DIR = Path(os.getenv('DATA_DIR', '/data'))
 MONITOR_CONFIG = DATA_DIR / "monitor_config.json"
 SERVER_REGISTRY = DATA_DIR / "server_registry.json"
 UPDATE_STATE_FILE = DATA_DIR / "update_state.json"
@@ -75,6 +83,107 @@ def parse_container_list(value: str) -> Set[str]:
     return {item.strip() for item in normalized.split() if item.strip()}
 
 
+def parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {'1', 'true', 'yes', 'on'}:
+        return True
+    if normalized in {'0', 'false', 'no', 'off'}:
+        return False
+    return default
+
+
+def parse_remote_servers_config(raw_value: str) -> Dict[str, Dict[str, Any]]:
+    if not raw_value.strip():
+        return {}
+
+    try:
+        data = json.loads(raw_value)
+    except Exception as exc:
+        logger.warning(f'REMOTE_SERVERS_JSON 解析失败，已忽略: {exc}')
+        return {}
+
+    if isinstance(data, dict):
+        items = []
+        for name, config in data.items():
+            if isinstance(config, dict):
+                item = dict(config)
+                item.setdefault('name', str(name))
+                items.append(item)
+        data = items
+
+    if not isinstance(data, list):
+        logger.warning('REMOTE_SERVERS_JSON 必须为 JSON 数组或对象，已忽略')
+        return {}
+
+    remote_servers: Dict[str, Dict[str, Any]] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        name = str(item.get('name') or item.get('server') or item.get('host') or '').strip()
+        if not name:
+            continue
+
+        transport = str(item.get('transport') or 'ssh').strip().lower()
+        if transport not in {'ssh', 'queue'}:
+            transport = 'ssh'
+
+        port_value = item.get('port', 22)
+        try:
+            port = int(port_value or 22)
+        except (TypeError, ValueError):
+            port = 22
+
+        connect_timeout_value = item.get('connect_timeout', SSH_CONNECT_TIMEOUT)
+        command_timeout_value = item.get('command_timeout', SSH_COMMAND_TIMEOUT)
+        try:
+            connect_timeout = max(int(connect_timeout_value or SSH_CONNECT_TIMEOUT), 5)
+        except (TypeError, ValueError):
+            connect_timeout = SSH_CONNECT_TIMEOUT
+        try:
+            command_timeout = max(int(command_timeout_value or SSH_COMMAND_TIMEOUT), 30)
+        except (TypeError, ValueError):
+            command_timeout = SSH_COMMAND_TIMEOUT
+
+        host = str(
+            item.get('host')
+            or item.get('tailscale_ip')
+            or item.get('address')
+            or ''
+        ).strip()
+
+        if transport == 'ssh' and not host:
+            logger.warning(f'远程服务器 {name} 缺少 host，已忽略 SSH 配置')
+            continue
+
+        remote_servers[name] = {
+            'name': name,
+            'transport': transport,
+            'host': host,
+            'user': str(item.get('user') or 'root').strip(),
+            'port': port,
+            'monitor_container': str(
+                item.get('monitor_container')
+                or item.get('container_name')
+                or 'watchtower-notifier'
+            ).strip(),
+            'identity_file': str(item.get('identity_file') or item.get('ssh_key') or '').strip(),
+            'strict_host_key_checking': parse_bool(item.get('strict_host_key_checking'), False),
+            'known_hosts_file': str(item.get('known_hosts_file') or '').strip(),
+            'connect_timeout': connect_timeout,
+            'command_timeout': command_timeout,
+            'docker_bin': str(item.get('docker_bin') or 'docker').strip(),
+            'python_bin': str(item.get('python_bin') or 'python3').strip(),
+            'rpc_path': str(item.get('rpc_path') or '/app/monitor.py').strip(),
+        }
+
+    return remote_servers
+
+
 def escape_html(value: Any) -> str:
     return html_lib.escape(str(value), quote=False)
 
@@ -97,6 +206,8 @@ logging.basicConfig(
    datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+REMOTE_SERVER_CONFIGS = parse_remote_servers_config(os.getenv('REMOTE_SERVERS_JSON', ''))
 
 shutdown_flag = threading.Event()
 
@@ -234,6 +345,70 @@ def safe_update_json(file_path: Path, updater: Callable[[Dict], Dict], default: 
                time.sleep(0.5)
 
    return None
+
+
+def resolve_update_mode() -> str:
+    if UPDATE_SOURCE == 'watchtower':
+        return 'watchtower'
+    if UPDATE_SOURCE == 'independent':
+        return 'independent'
+    return 'watchtower' if DockerManager.has_watchtower_deployment() else 'independent'
+
+
+def extract_json_payload(output: str) -> Dict[str, Any]:
+    text = (output or '').strip()
+    if not text:
+        raise ValueError('命令输出为空')
+
+    candidates = [line.strip() for line in text.splitlines() if line.strip()]
+    for candidate in reversed(candidates):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+    return json.loads(text)
+
+
+def build_inventory_payload(server_name: str, docker: 'DockerManager',
+                            config: 'ConfigManager') -> Dict[str, Any]:
+    collected_at = time.time()
+    all_containers = sorted(docker.get_all_containers())
+    excluded = sorted(config.get_excluded_containers())
+    monitored = []
+    containers: Dict[str, Dict[str, Any]] = {}
+
+    for container in all_containers:
+        info = docker.get_container_info(container)
+        if not info:
+            continue
+
+        is_monitored = config.is_monitored(container)
+        if is_monitored:
+            monitored.append(container)
+
+        containers[container] = {
+            'image': info.get('image', 'unknown'),
+            'current_image_id': info.get('image_id', 'unknown'),
+            'current_version': docker._format_version_info(info, container),
+            'running': info.get('running', False),
+            'health': info.get('health'),
+            'monitored': is_monitored,
+            'last_checked_at': collected_at,
+        }
+
+    return {
+        'ok': True,
+        'server_name': server_name,
+        'transport': 'local',
+        'mode': resolve_update_mode(),
+        'collected_at': collected_at,
+        'total_containers': len(all_containers),
+        'monitored_containers': sorted(monitored),
+        'excluded_containers': excluded,
+        'static_monitored_containers': sorted(config.get_static_monitored_containers()),
+        'containers': containers,
+    }
 
 class HealthReporter:
     def __init__(self, health_file: Path, server_name: str):
@@ -436,6 +611,230 @@ class RemoteCommandQueue:
             return data
 
         safe_update_json(self.queue_file, updater, default={})
+
+
+class RemoteServerController:
+    def __init__(self, local_server_name: str, docker: 'DockerManager',
+                 config: 'ConfigManager', registry: 'ServerRegistry'):
+        self.local_server_name = local_server_name
+        self.docker = docker
+        self.config = config
+        self.registry = registry
+        self._inventory_cache: Dict[str, Dict[str, Any]] = {}
+
+    def is_local_server(self, server: str) -> bool:
+        return server == self.local_server_name
+
+    def uses_ssh(self, server: str) -> bool:
+        if self.is_local_server(server) or REMOTE_CONTROL_MODE == 'queue':
+            return False
+        config = REMOTE_SERVER_CONFIGS.get(server)
+        return bool(config and config.get('transport') == 'ssh')
+
+    def uses_queue(self, server: str) -> bool:
+        if self.is_local_server(server):
+            return False
+        if REMOTE_CONTROL_MODE == 'ssh':
+            return not self.uses_ssh(server)
+        config = REMOTE_SERVER_CONFIGS.get(server)
+        if config and config.get('transport') == 'queue':
+            return True
+        return not self.uses_ssh(server)
+
+    def invalidate_cache(self, server: str):
+        self._inventory_cache.pop(server, None)
+
+    def _build_local_inventory(self) -> Dict[str, Any]:
+        return build_inventory_payload(self.local_server_name, self.docker, self.config)
+
+    def _build_legacy_inventory(self, server: str) -> Dict[str, Any]:
+        update_state = safe_read_json(UPDATE_STATE_FILE, default={})
+        server_state = dict(update_state.get(server, {}))
+        snapshots = dict(server_state.get('containers', {}))
+        registry_data = safe_read_json(self.registry.registry_file, default={})
+        registry_entry = dict(registry_data.get(server, {}))
+        excluded = sorted(self.config.get_excluded_containers(server))
+        monitored = []
+        containers: Dict[str, Dict[str, Any]] = {}
+
+        for name, info in sorted(snapshots.items()):
+            is_monitored = self.config.is_monitored(name, server)
+            if is_monitored:
+                monitored.append(name)
+            container_info = dict(info)
+            container_info.setdefault('monitored', is_monitored)
+            containers[name] = container_info
+
+        collected_at = float(
+            server_state.get('updated_at')
+            or registry_entry.get('last_heartbeat')
+            or 0
+        )
+
+        return {
+            'ok': True,
+            'server_name': server,
+            'transport': 'queue',
+            'mode': registry_entry.get('mode', 'unknown'),
+            'collected_at': collected_at,
+            'total_containers': len(snapshots),
+            'monitored_containers': sorted(monitored),
+            'excluded_containers': excluded,
+            'static_monitored_containers': [],
+            'containers': containers,
+        }
+
+    def _build_ssh_command(self, config: Dict[str, Any], remote_command: str) -> List[str]:
+        ssh_command = ['ssh', '-o', 'BatchMode=yes']
+        ssh_command.extend(['-o', f'ConnectTimeout={config["connect_timeout"]}'])
+        ssh_command.extend(['-o', 'ServerAliveInterval=15'])
+        ssh_command.extend(['-o', 'ServerAliveCountMax=3'])
+
+        identity_file = config.get('identity_file', '')
+        if identity_file:
+            ssh_command.extend(['-i', identity_file])
+
+        known_hosts_file = config.get('known_hosts_file', '')
+        if config.get('strict_host_key_checking'):
+            if known_hosts_file:
+                ssh_command.extend(['-o', f'UserKnownHostsFile={known_hosts_file}'])
+        else:
+            ssh_command.extend(['-o', 'StrictHostKeyChecking=no'])
+            ssh_command.extend(['-o', f'UserKnownHostsFile={known_hosts_file or "/dev/null"}'])
+
+        ssh_command.extend(['-p', str(config['port'])])
+
+        user = config.get('user', '').strip()
+        host = config.get('host', '').strip()
+        target = f'{user}@{host}' if user else host
+        ssh_command.append(target)
+        ssh_command.append(remote_command)
+        return ssh_command
+
+    def _run_remote_rpc(self, server: str, *rpc_args: str, timeout: Optional[int] = None) -> Dict[str, Any]:
+        config = REMOTE_SERVER_CONFIGS.get(server)
+        if not config:
+            raise RuntimeError(f'未找到服务器 {server} 的远程配置')
+
+        remote_command = shlex.join([
+            config['docker_bin'],
+            'exec',
+            config['monitor_container'],
+            config['python_bin'],
+            config['rpc_path'],
+            'rpc',
+            *rpc_args,
+        ])
+        ssh_command = self._build_ssh_command(config, remote_command)
+
+        try:
+            result = subprocess.run(
+                ssh_command,
+                capture_output=True,
+                text=True,
+                timeout=timeout or config['command_timeout'],
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f'SSH 远程命令超时: {server}') from exc
+        except Exception as exc:
+            raise RuntimeError(f'SSH 执行失败: {exc}') from exc
+
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or '未知错误').strip()[:300]
+            raise RuntimeError(f'SSH 远程命令失败: {message}')
+
+        try:
+            payload = extract_json_payload(result.stdout)
+        except Exception as exc:
+            raise RuntimeError(f'远程返回内容不是有效 JSON: {(result.stdout or "")[:200]}') from exc
+
+        if not payload.get('ok', False):
+            raise RuntimeError(str(payload.get('error') or '远程命令返回失败'))
+
+        return payload
+
+    def _fetch_inventory_via_ssh(self, server: str) -> Dict[str, Any]:
+        payload = self._run_remote_rpc(server, 'inventory', timeout=60)
+        payload['transport'] = 'ssh'
+        return payload
+
+    def get_inventory(self, server: str, force_refresh: bool = False) -> Dict[str, Any]:
+        if self.is_local_server(server):
+            return self._build_local_inventory()
+
+        if self.uses_ssh(server):
+            cache_entry = self._inventory_cache.get(server, {})
+            if not force_refresh and cache_entry:
+                cached_at = float(cache_entry.get('cached_at', 0) or 0)
+                if time.time() - cached_at < REMOTE_CACHE_TTL:
+                    return dict(cache_entry['payload'])
+
+            payload = self._fetch_inventory_via_ssh(server)
+            self._inventory_cache[server] = {
+                'cached_at': time.time(),
+                'payload': dict(payload),
+            }
+            return payload
+
+        return self._build_legacy_inventory(server)
+
+    def get_available_servers(self) -> List[str]:
+        servers: List[str] = []
+
+        if self.local_server_name:
+            servers.append(self.local_server_name)
+
+        for server in self.registry.get_active_servers():
+            if server not in servers:
+                servers.append(server)
+
+        if REMOTE_CONTROL_MODE != 'queue':
+            for server, config in REMOTE_SERVER_CONFIGS.items():
+                if config.get('transport') != 'ssh' or server in servers:
+                    continue
+                try:
+                    self.get_inventory(server)
+                    servers.append(server)
+                except Exception as exc:
+                    logger.warning(f'远程服务器 {server} 不可达，暂不加入在线列表: {exc}')
+
+        return servers
+
+    def execute_action(self, action: str, server: str, container: str) -> Dict[str, Any]:
+        rpc_action = {
+            'confirm_update': 'update',
+            'confirm_restart': 'restart',
+        }.get(action)
+        if not rpc_action:
+            raise RuntimeError(f'不支持的远程动作: {action}')
+
+        payload = self._run_remote_rpc(
+            server,
+            rpc_action,
+            '--container',
+            container,
+            timeout=max(SSH_COMMAND_TIMEOUT, 600),
+        )
+        self.invalidate_cache(server)
+        return payload
+
+    def update_monitor_membership(self, action: str, server: str, container: str) -> Dict[str, Any]:
+        rpc_action = {
+            'add': 'monitor-add',
+            'remove': 'monitor-remove',
+        }.get(action)
+        if not rpc_action:
+            raise RuntimeError(f'不支持的监控动作: {action}')
+
+        payload = self._run_remote_rpc(
+            server,
+            rpc_action,
+            '--container',
+            container,
+            timeout=60,
+        )
+        self.invalidate_cache(server)
+        return payload
 
 class CommandCoordinator:
    def __init__(self, server_name: str, primary_server: bool, registry_file: Path):
@@ -1501,42 +1900,55 @@ class CommandHandler:
         self.config = config
         self.registry = registry
         self.command_queue = RemoteCommandQueue(COMMAND_QUEUE_FILE)
+        self.remote_controller = RemoteServerController(bot.server_name, docker, config, registry)
         self._processing_callbacks = set()
 
     def _is_local_server(self, server: str) -> bool:
-        return server == self.bot.server_name
+        return self.remote_controller.is_local_server(server)
 
     def _get_update_state(self) -> Dict:
         return safe_read_json(UPDATE_STATE_FILE, default={})
 
-    def _get_live_local_snapshots(self) -> Dict[str, Dict]:
-        snapshots = {}
-        for container in self.docker.get_all_containers():
-            info = self.docker.get_container_info(container)
-            if info:
-                snapshots[container] = {
-                    'current_version': self.docker._format_version_info(info, container),
-                    'running': info.get('running', False),
-                    'health': info.get('health'),
-                    'image': info.get('image', 'unknown')
-                }
-        return snapshots
+    def _get_available_servers(self) -> List[str]:
+        return self.remote_controller.get_available_servers()
 
-    def _get_server_snapshots(self, server: str) -> Dict[str, Dict]:
-        data = self._get_update_state()
-        snapshots = dict(data.get(server, {}).get('containers', {}))
-        if snapshots:
-            return snapshots
-        if self._is_local_server(server):
-            return self._get_live_local_snapshots()
-        return {}
+    def _get_server_inventory(self, server: str, force_refresh: bool = False) -> Dict[str, Any]:
+        try:
+            return self.remote_controller.get_inventory(server, force_refresh=force_refresh)
+        except Exception as exc:
+            logger.error(f'获取服务器 {server} 状态失败: {exc}')
+            if self._is_local_server(server):
+                return self.remote_controller.get_inventory(server, force_refresh=True)
+            return {
+                'ok': False,
+                'server_name': server,
+                'transport': 'unknown',
+                'mode': 'unknown',
+                'collected_at': 0,
+                'total_containers': 0,
+                'monitored_containers': [],
+                'excluded_containers': [],
+                'static_monitored_containers': [],
+                'containers': {},
+            }
+
+    def _get_server_snapshots(self, server: str, force_refresh: bool = False) -> Dict[str, Dict]:
+        inventory = self._get_server_inventory(server, force_refresh=force_refresh)
+        return dict(inventory.get('containers', {}))
 
     def _get_server_containers(self, server: str) -> List[str]:
         return sorted(self._get_server_snapshots(server).keys())
 
     def _get_server_update_meta(self, server: str) -> Dict:
-        data = self._get_update_state()
-        return dict(data.get(server, {}))
+        inventory = self._get_server_inventory(server)
+        return {
+            'mode': inventory.get('mode', 'unknown'),
+            'transport': inventory.get('transport', 'unknown'),
+            'updated_at': inventory.get('collected_at', 0),
+            'total_containers': inventory.get('total_containers', 0),
+            'monitored_containers': list(inventory.get('monitored_containers', [])),
+            'excluded_containers': list(inventory.get('excluded_containers', [])),
+        }
 
     def _send_or_edit(self, chat_id: str, text: str, reply_markup: Optional[Dict] = None,
                       message_id: Optional[str] = None):
@@ -1556,7 +1968,7 @@ class CommandHandler:
         threading.Thread(target=runner, daemon=True).start()
 
     def handle_servers(self, chat_id: str):
-        servers = self.registry.get_active_servers()
+        servers = self._get_available_servers()
         registry_data = safe_read_json(self.registry.registry_file, default={})
         if not servers:
             self.bot.send_message('⚠️ 当前没有活跃的服务器')
@@ -1569,19 +1981,24 @@ class CommandHandler:
 
         server_msg = f"🌐 <b>在线服务器 ({len(servers)})</b>\n\n"
         for server in servers:
+            inventory = self._get_server_inventory(server)
             server_info = registry_data.get(server, {})
-            last_heartbeat = server_info.get('last_heartbeat', 0)
-            time_diff = time.time() - last_heartbeat
+            collected_at = float(inventory.get('collected_at') or server_info.get('last_heartbeat') or 0)
+            time_diff = time.time() - collected_at if collected_at else 10 ** 9
             if time_diff < 30:
                 time_text = '刚刚'
             elif time_diff < 60:
                 time_text = f'{int(time_diff)}秒前'
+            elif collected_at <= 0:
+                time_text = '未知'
             else:
                 minutes = int(time_diff / 60)
                 time_text = f'{minutes}分钟前' if minutes < 60 else f'{int(minutes/60)}小时前'
-            container_count = server_info.get('container_count', 0)
+            container_count = inventory.get('total_containers', server_info.get('container_count', 0))
             marker = ' 🌟' if server_info.get('is_primary', False) else ''
+            transport = inventory.get('transport', 'unknown')
             server_msg += f"🖥️ <b>{escape_html(server)}{marker}</b> ({container_count}个容器)\n"
+            server_msg += f"   通道: <code>{escape_html(transport)}</code>\n"
             server_msg += f"   最后心跳: {time_text}\n\n"
 
         server_msg += '━━━━━━━━━━━━━━━━━━━━\n'
@@ -1590,7 +2007,7 @@ class CommandHandler:
         self.bot.send_message(server_msg)
 
     def handle_status(self, chat_id: str):
-        servers = self.registry.get_active_servers()
+        servers = self._get_available_servers()
         if len(servers) > 1:
             buttons = {
                 'inline_keyboard': [
@@ -1603,17 +2020,21 @@ class CommandHandler:
             self._show_server_status(chat_id, servers[0] if servers else SERVER_NAME)
 
     def _show_server_status(self, chat_id: str, server: str, message_id: Optional[str] = None):
-        snapshots = self._get_server_snapshots(server)
+        inventory = self._get_server_inventory(server, force_refresh=True)
+        snapshots = dict(inventory.get('containers', {}))
         all_containers = sorted(snapshots.keys())
-        monitored = [container for container in all_containers if self.config.is_monitored(container, server)]
-        excluded = sorted(self.config.get_excluded_containers(server))
+        monitored = list(inventory.get('monitored_containers', []))
+        excluded = list(inventory.get('excluded_containers', []))
         update_meta = self._get_server_update_meta(server)
         registry_data = safe_read_json(self.registry.registry_file, default={})
         server_registry = registry_data.get(server, {})
-        mode = server_registry.get('mode', 'unknown')
+        mode = update_meta.get('mode') or server_registry.get('mode', 'unknown')
+        transport = update_meta.get('transport', 'unknown')
         last_sync = update_meta.get('updated_at')
-        queue_count = self.command_queue.count_pending(server)
+        queue_count = self.command_queue.count_pending(server) if transport == 'queue' else 0
         sync_text = datetime.fromtimestamp(last_sync).strftime('%Y-%m-%d %H:%M:%S') if last_sync else '未同步'
+        if transport in {'ssh', 'local'} and last_sync:
+            sync_text = f"{sync_text} (实时)"
 
         status_msg = f"""📊 <b>服务器状态</b>
 
@@ -1623,6 +2044,7 @@ class CommandHandler:
   时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
   版本: <code>v{VERSION}</code>
   模式: <code>{escape_html(mode)}</code>
+  通道: <code>{escape_html(transport)}</code>
   同步: <code>{sync_text}</code>
   队列: <code>{queue_count}</code>
 
@@ -1652,7 +2074,7 @@ class CommandHandler:
         self._send_or_edit(chat_id, status_msg, message_id=message_id)
 
     def handle_update(self, chat_id: str):
-        servers = self.registry.get_active_servers()
+        servers = self._get_available_servers()
         if not servers:
             self.bot.send_message('⚠️ 没有可用的服务器')
             return
@@ -1668,7 +2090,8 @@ class CommandHandler:
             self._show_update_containers(chat_id, servers[0])
 
     def _show_update_containers(self, chat_id: str, server: str, message_id: Optional[str] = None):
-        containers = [container for container in self._get_server_containers(server) if self.config.is_monitored(container, server)]
+        inventory = self._get_server_inventory(server, force_refresh=True)
+        containers = sorted(inventory.get('monitored_containers', []))
         if not containers:
             self._send_or_edit(chat_id, f'⚠️ 服务器 <code>{escape_html(server)}</code> 没有可更新的容器', message_id=message_id)
             return
@@ -1682,7 +2105,7 @@ class CommandHandler:
         self._send_or_edit(chat_id, text, buttons, message_id)
 
     def handle_restart(self, chat_id: str):
-        servers = self.registry.get_active_servers()
+        servers = self._get_available_servers()
         if not servers:
             self.bot.send_message('⚠️ 没有可用的服务器')
             return
@@ -1734,7 +2157,7 @@ class CommandHandler:
         self.bot.send_message('📡 <b>监控管理</b>\n\n请选择操作：', buttons)
 
     def handle_help(self):
-        servers = self.registry.get_active_servers()
+        servers = self._get_available_servers()
         registry = safe_read_json(self.registry.registry_file, default={})
         server_lines = []
         for server in servers:
@@ -1762,12 +2185,65 @@ class CommandHandler:
 💡 <b>使用提示：</b>
 
 • 仅主服务器轮询 Telegram Bot，避免 getUpdates 冲突
-• 远程服务器的状态展示使用共享状态文件
-• 远程服务器的重启/更新通过共享队列分发执行
+• 优先使用 SSH/Tailscale 实时读取远程状态并执行更新/重启
+• 未配置 SSH 时，会自动回退到旧的共享状态文件 + 任务队列模式
 • 设置 <code>MONITORED_CONTAINERS</code> 后将启用固定名单模式
 • <code>ENABLE_ROLLBACK=true</code> 时，更新失败会自动回滚
 ━━━━━━━━━━━━━━━━━━━━"""
         self.bot.send_message(help_msg)
+
+    def _render_update_result(self, server: str, container: str, result: Dict[str, Any]) -> str:
+        if result.get('success'):
+            return f"""✅ <b>更新成功</b>
+
+━━━━━━━━━━━━━━━━━━━━
+🖥️ 服务器: <code>{escape_html(server)}</code>
+📦 容器: <code>{escape_html(container)}</code>
+
+🔄 <b>版本变更</b>
+  旧: <code>{escape_html(result.get('old_version', 'unknown'))}</code>
+  新: <code>{escape_html(result.get('new_version', 'unknown'))}</code>
+
+⏰ 时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
+━━━━━━━━━━━━━━━━━━━━
+
+{escape_html(result.get('message', '操作完成'))}"""
+
+        return f"""❌ <b>更新失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+🖥️ 服务器: <code>{escape_html(server)}</code>
+📦 容器: <code>{escape_html(container)}</code>
+
+❌ <b>错误信息</b>
+  {escape_html(result.get('message', '未知错误'))}
+
+💡 <b>建议</b>
+  • 检查镜像名称是否正确
+  • 查看容器日志排查问题
+  • 尝试手动更新容器
+━━━━━━━━━━━━━━━━━━━━"""
+
+    def _render_restart_result(self, server: str, container: str, success: bool, message: str = '') -> str:
+        if success:
+            return f"""✅ <b>重启成功</b>
+
+━━━━━━━━━━━━━━━━━━━━
+🖥️ 服务器: <code>{escape_html(server)}</code>
+📦 容器: <code>{escape_html(container)}</code>
+⏰ 时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
+━━━━━━━━━━━━━━━━━━━━"""
+
+        details = escape_html(message or '请检查容器状态')
+        return f"""❌ <b>重启失败</b>
+
+━━━━━━━━━━━━━━━━━━━━
+🖥️ 服务器: <code>{escape_html(server)}</code>
+📦 容器: <code>{escape_html(container)}</code>
+
+❌ <b>错误信息</b>
+  {details}
+━━━━━━━━━━━━━━━━━━━━"""
 
     def _execute_update(self, chat_id: str, message_id: str, server: str, container: str):
         current_msg = f'⏳ 正在更新容器 <code>{escape_html(container)}</code>...\n\n'
@@ -1780,59 +2256,51 @@ class CommandHandler:
                 last_progress[0] = time.time()
 
         result = self.docker.update_container(container, progress_update)
-        if result['success']:
-            result_msg = f"""✅ <b>更新成功</b>
-
-━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>{escape_html(server)}</code>
-📦 容器: <code>{escape_html(container)}</code>
-
-🔄 <b>版本变更</b>
-  旧: <code>{escape_html(result['old_version'])}</code>
-  新: <code>{escape_html(result['new_version'])}</code>
-
-⏰ 时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
-━━━━━━━━━━━━━━━━━━━━
-
-{escape_html(result['message'])}"""
-        else:
-            result_msg = f"""❌ <b>更新失败</b>
-
-━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>{escape_html(server)}</code>
-📦 容器: <code>{escape_html(container)}</code>
-
-❌ <b>错误信息</b>
-  {escape_html(result['message'])}
-
-💡 <b>建议</b>
-  • 检查镜像名称是否正确
-  • 查看容器日志排查问题
-  • 尝试手动更新容器
-━━━━━━━━━━━━━━━━━━━━"""
-        self.bot.edit_message(chat_id, message_id, result_msg)
+        self.bot.edit_message(chat_id, message_id, self._render_update_result(server, container, result))
 
     def _execute_restart(self, chat_id: str, message_id: str, server: str, container: str):
         self.bot.edit_message(chat_id, message_id, f'⏳ 正在重启容器 <code>{escape_html(container)}</code>...')
         success = self.docker.restart_container(container)
-        if success:
-            result_msg = f"""✅ <b>重启成功</b>
+        self.bot.edit_message(chat_id, message_id, self._render_restart_result(server, container, success))
 
-━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>{escape_html(server)}</code>
-📦 容器: <code>{escape_html(container)}</code>
-⏰ 时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
-━━━━━━━━━━━━━━━━━━━━"""
-        else:
-            result_msg = f"""❌ <b>重启失败</b>
+    def _execute_remote_action_via_ssh(self, action: str, chat_id: str, message_id: str,
+                                       server: str, container: str):
+        action_text = '更新' if action == 'confirm_update' else '重启'
+        self.bot.edit_message(
+            chat_id,
+            message_id,
+            f'⏳ 正在通过 SSH 执行远程{action_text}...\n\n'
+            f'🖥️ 目标服务器: <code>{escape_html(server)}</code>\n'
+            f'📦 容器: <code>{escape_html(container)}</code>'
+        )
 
-━━━━━━━━━━━━━━━━━━━━
-🖥️ 服务器: <code>{escape_html(server)}</code>
-📦 容器: <code>{escape_html(container)}</code>
+        try:
+            payload = self.remote_controller.execute_action(action, server, container)
+            result = dict(payload.get('result', {}))
+            if action == 'confirm_update':
+                message = self._render_update_result(server, container, result)
+            else:
+                message = self._render_restart_result(
+                    server,
+                    container,
+                    bool(result.get('success')),
+                    result.get('message', ''),
+                )
+        except Exception as exc:
+            if action == 'confirm_update':
+                message = self._render_update_result(server, container, {
+                    'success': False,
+                    'message': f'SSH 远程更新失败: {exc}',
+                })
+            else:
+                message = self._render_restart_result(
+                    server,
+                    container,
+                    False,
+                    f'SSH 远程重启失败: {exc}',
+                )
 
-请检查容器状态
-━━━━━━━━━━━━━━━━━━━━"""
-        self.bot.edit_message(chat_id, message_id, result_msg)
+        self.bot.edit_message(chat_id, message_id, message)
 
     def process_remote_job(self, job: Dict):
         action = job.get('action')
@@ -1869,6 +2337,16 @@ class CommandHandler:
         self.bot.edit_message(chat_id, message_id, failure_msg)
 
     def _enqueue_remote_action(self, action: str, server: str, container: str, chat_id: str, message_id: str):
+        if self.remote_controller.uses_ssh(server):
+            waiting = '⏳ 已提交远程更新任务...' if action == 'confirm_update' else '⏳ 已提交远程重启任务...'
+            waiting += f"\n\n🖥️ 目标服务器: <code>{escape_html(server)}</code>"
+            waiting += f"\n📦 容器: <code>{escape_html(container)}</code>"
+            waiting += '\n🧭 执行方式: <code>ssh</code>'
+            waiting += '\n\n请稍候，主服务器会通过 SSH 直连远程监控容器并继续回写此消息。'
+            self.bot.edit_message(chat_id, message_id, waiting)
+            self._run_async(self._execute_remote_action_via_ssh, action, chat_id, message_id, server, container)
+            return
+
         job_id = self.command_queue.enqueue(server, action, {
             'server': server,
             'container': container,
@@ -1893,6 +2371,7 @@ class CommandHandler:
         waiting += f"\n\n🖥️ 目标服务器: <code>{escape_html(server)}</code>"
         waiting += f"\n📦 容器: <code>{escape_html(container)}</code>"
         waiting += f"\n🧾 任务号: <code>{escape_html(job_id)}</code>"
+        waiting += '\n🧭 执行方式: <code>queue</code>'
         waiting += '\n\n请稍候，目标服务器开始执行后会继续回写此消息。'
         self.bot.edit_message(chat_id, message_id, waiting)
 
@@ -1977,7 +2456,7 @@ class CommandHandler:
                 if action_type == 'list':
                     self.handle_status(chat_id)
                 else:
-                    servers = self.registry.get_active_servers()
+                    servers = self._get_available_servers()
                     if len(servers) == 1:
                         self._handle_monitor_server(chat_id, message_id, action_type, servers[0])
                     else:
@@ -1993,11 +2472,17 @@ class CommandHandler:
                 self._handle_monitor_server(chat_id, message_id, parts[1], parts[2])
             elif action == 'add_mon':
                 server, container = parts[1], parts[2]
-                self.config.remove_excluded(container, server)
+                if self.remote_controller.uses_ssh(server):
+                    self.remote_controller.update_monitor_membership('add', server, container)
+                else:
+                    self.config.remove_excluded(container, server)
                 self.bot.edit_message(chat_id, message_id, f'✅ <b>添加成功</b>\n\n已将 <code>{escape_html(container)}</code> 添加到服务器 <code>{escape_html(server)}</code> 的监控列表')
             elif action == 'rem_mon':
                 server, container = parts[1], parts[2]
-                self.config.add_excluded(container, server)
+                if self.remote_controller.uses_ssh(server):
+                    self.remote_controller.update_monitor_membership('remove', server, container)
+                else:
+                    self.config.add_excluded(container, server)
                 self.bot.edit_message(chat_id, message_id, f'✅ <b>移除成功</b>\n\n已将 <code>{escape_html(container)}</code> 从服务器 <code>{escape_html(server)}</code> 的监控列表移除')
             elif action == 'cancel':
                 self.bot.edit_message(chat_id, message_id, '❌ 操作已取消')
@@ -2010,8 +2495,9 @@ class CommandHandler:
             threading.Thread(target=cleanup, daemon=True).start()
 
     def _handle_monitor_server(self, chat_id: str, message_id: str, action: str, server: str):
+        inventory = self._get_server_inventory(server, force_refresh=True)
         if action == 'add':
-            excluded = sorted(self.config.get_excluded_containers(server))
+            excluded = sorted(inventory.get('excluded_containers', []))
             if not excluded:
                 self.bot.edit_message(chat_id, message_id, f'✅ 服务器 <code>{escape_html(server)}</code> 所有容器都已在监控中')
                 return
@@ -2024,7 +2510,7 @@ class CommandHandler:
             text = f'📡 <b>添加监控</b>\n\n🖥️ 服务器: <code>{escape_html(server)}</code>\n\n请选择要添加监控的容器：'
             self.bot.edit_message(chat_id, message_id, text, buttons)
         else:
-            monitored = [container for container in self._get_server_containers(server) if self.config.is_monitored(container, server)]
+            monitored = sorted(inventory.get('monitored_containers', []))
             if not monitored:
                 self.bot.edit_message(chat_id, message_id, f'⚠️ 服务器 <code>{escape_html(server)}</code> 当前没有监控中的容器')
                 return
@@ -2210,11 +2696,7 @@ class WatchtowerMonitor:
             })
 
     def _resolve_mode(self) -> str:
-        if UPDATE_SOURCE == 'watchtower':
-            return 'watchtower'
-        if UPDATE_SOURCE == 'independent':
-            return 'independent'
-        return 'watchtower' if self.docker.has_watchtower_deployment() else 'independent'
+        return resolve_update_mode()
 
     def start(self):
         mode = self._resolve_mode()
@@ -2702,7 +3184,115 @@ class WatchtowerMonitor:
 🕐 <b>时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
 ━━━━━━━━━━━━━━━━━━━━''')
 
+
+def emit_rpc_payload(payload: Dict[str, Any]) -> int:
+    print(json.dumps(payload, ensure_ascii=False))
+    return 0 if payload.get('ok', False) else 1
+
+
+def run_rpc(argv: List[str]) -> int:
+    parser = argparse.ArgumentParser(prog='monitor.py rpc')
+    subparsers = parser.add_subparsers(dest='rpc_command', required=True)
+
+    subparsers.add_parser('ping')
+    subparsers.add_parser('inventory')
+
+    update_parser = subparsers.add_parser('update')
+    update_parser.add_argument('--container', required=True)
+
+    restart_parser = subparsers.add_parser('restart')
+    restart_parser.add_argument('--container', required=True)
+
+    monitor_add_parser = subparsers.add_parser('monitor-add')
+    monitor_add_parser.add_argument('--container', required=True)
+
+    monitor_remove_parser = subparsers.add_parser('monitor-remove')
+    monitor_remove_parser.add_argument('--container', required=True)
+
+    args = parser.parse_args(argv)
+    server_name = SERVER_NAME or os.getenv('SERVER_NAME') or 'unknown'
+    docker = DockerManager()
+    config = ConfigManager(MONITOR_CONFIG, server_name)
+
+    try:
+        if args.rpc_command == 'ping':
+            return emit_rpc_payload({
+                'ok': True,
+                'server_name': server_name,
+                'version': VERSION,
+                'mode': resolve_update_mode(),
+                'timestamp': time.time(),
+            })
+
+        if args.rpc_command == 'inventory':
+            payload = build_inventory_payload(server_name, docker, config)
+            payload['version'] = VERSION
+            return emit_rpc_payload(payload)
+
+        if args.rpc_command == 'update':
+            return emit_rpc_payload({
+                'ok': True,
+                'action': 'update',
+                'server_name': server_name,
+                'container': args.container,
+                'result': docker.update_container(args.container),
+                'timestamp': time.time(),
+            })
+
+        if args.rpc_command == 'restart':
+            success = docker.restart_container(args.container)
+            return emit_rpc_payload({
+                'ok': True,
+                'action': 'restart',
+                'server_name': server_name,
+                'container': args.container,
+                'result': {
+                    'success': success,
+                    'message': '容器重启成功' if success else '容器重启失败',
+                },
+                'timestamp': time.time(),
+            })
+
+        if args.rpc_command == 'monitor-add':
+            config.remove_excluded(args.container)
+            return emit_rpc_payload({
+                'ok': True,
+                'action': 'monitor-add',
+                'server_name': server_name,
+                'container': args.container,
+                'excluded_containers': sorted(config.get_excluded_containers()),
+                'timestamp': time.time(),
+            })
+
+        if args.rpc_command == 'monitor-remove':
+            config.add_excluded(args.container)
+            return emit_rpc_payload({
+                'ok': True,
+                'action': 'monitor-remove',
+                'server_name': server_name,
+                'container': args.container,
+                'excluded_containers': sorted(config.get_excluded_containers()),
+                'timestamp': time.time(),
+            })
+    except Exception as exc:
+        return emit_rpc_payload({
+            'ok': False,
+            'server_name': server_name,
+            'error': str(exc)[:300],
+            'timestamp': time.time(),
+        })
+
+    return emit_rpc_payload({
+        'ok': False,
+        'server_name': server_name,
+        'error': f'未知 RPC 命令: {args.rpc_command}',
+        'timestamp': time.time(),
+    })
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'rpc':
+        return run_rpc(sys.argv[2:])
+
     if not SERVER_NAME:
         logger.error("错误: 必须设置 SERVER_NAME 环境变量")
         sys.exit(1)
@@ -2764,7 +3354,7 @@ def main():
     if PRIMARY_SERVER:
         time.sleep(1)
         registry_data = safe_read_json(SERVER_REGISTRY, default={})
-        servers = registry.get_active_servers()
+        servers = handler._get_available_servers()
         primary_server = next(
             (server for server in servers if registry_data.get(server, {}).get('is_primary', False)),
             SERVER_NAME if PRIMARY_SERVER else '未知'
@@ -2803,6 +3393,7 @@ def main():
 💡 <b>本版重点</b>
    • 默认使用独立更新检测模式
    • 检测到 watchtower 时自动兼容旧模式
+   • 远程优先走 SSH/Tailscale，旧共享队列仍可回退
    • 仅在真正有变化时发送通知
 
 ⏰ <b>启动时间</b>
@@ -2839,7 +3430,7 @@ def main():
         health.beat('main', status='stopped', details={'exit_code': exit_code})
         logger.info("服务已停止")
 
-    sys.exit(exit_code)
+    return exit_code
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

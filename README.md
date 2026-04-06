@@ -12,9 +12,10 @@
 - 🔁 **自动兼容旧模式** - 检测到现有 watchtower 部署时自动切回旧版日志监控模式
 - 🔔 **精准通知** - 仅在真正发现新版本、更新成功或更新失败时通知，避免重复刷屏
 - 🌐 **多服务器管理** - 一个 Bot 统一管理多台服务器
+- 🔐 **SSH + Tailscale 优先** - 主服务器可通过 SSH 直连远程监控容器，避免 NFS 卡死拖垮整套链路
 - 🤖 **交互式命令** - 通过 Telegram 直接查询和管理
 - 🔄 **自动回滚** - 更新失败自动恢复旧版本
-- 💾 **状态持久化** - 共享状态文件记录检查结果、失败重试和通知去重
+- 💾 **状态持久化** - 本地状态文件记录检查结果、失败重试和通知去重，旧 NFS 共享模式仍可保留
 - 🎯 **灵活监控** - 支持全部或指定容器监控
 
 ## 📸 效果预览
@@ -96,54 +97,42 @@ docker compose logs -f
 
 ### 多服务器部署
 
-支持两种方式实现多服务器数据共享：
+当前支持两种多服务器控制方案：
 
-#### 方式一：Tailscale 虚拟局域网（推荐）
+#### 方式一：SSH + Tailscale（推荐）
 
-**优点：** 简单、安全、无需配置防火墙
+**适用场景：** 主服务器统一收 Telegram 命令，远程服务器各自本地保存 `/data`，通过 SSH 实时执行 `/status`、`/update`、`/restart`、`/monitor`。
 
 ```bash
 # 1. 每台服务器安装 Tailscale
 curl -fsSL https://tailscale.com/install.sh | sh
 sudo tailscale up
 
-# 2. 查看分配的 IP
+# 2. 记录每台服务器的 Tailscale IP
 tailscale ip -4
 # 例如: 100.64.1.10
 
-# 3. 在主服务器上配置 NFS
-sudo apt-get install -y nfs-kernel-server
-sudo mkdir -p /srv/watchtower-shared
-sudo chmod 777 /srv/watchtower-shared
+# 3. 在主服务器生成 SSH 密钥，并分发到远程服务器
+mkdir -p ssh
+ssh-keygen -t ed25519 -f ./ssh/id_ed25519 -N ''
+ssh-copy-id -i ./ssh/id_ed25519.pub root@100.64.1.20
 
-sudo nano /etc/exports
-# 添加: /srv/watchtower-shared *(rw,sync,no_subtree_check,no_root_squash)
+# 4. 主服务器 .env 增加远程控制配置
+cat >> .env <<'EOF'
+REMOTE_CONTROL_MODE=auto
+REMOTE_SERVERS_JSON=[{"name":"云服务V2","transport":"ssh","host":"100.64.1.20","user":"root","port":22,"monitor_container":"watchtower-notifier"}]
+EOF
 
-sudo exportfs -ra
-sudo systemctl restart nfs-kernel-server
-
-# 4. 其他服务器把 notifier 的 `/data` 改为 NFS 挂载
-services:
-  watchtower-notifier:
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - nfs-data:/data
-
-volumes:
-  nfs-data:
-    driver: local
-    driver_opts:
-      type: nfs
-      o: addr=100.64.1.10,rw,nfsvers=4  # Tailscale IP
-      device: ":/srv/watchtower-shared"
-
-# 5. 每台服务器使用不同的 SERVER_NAME 启动
+# 5. 所有服务器继续使用本地 ./data，各自启动监控容器
+mkdir -p data ssh
 docker compose up -d
 ```
 
-#### 方式二：公网 NFS
+`docker/docker-compose.yml` 已预留 `./ssh:/ssh:ro` 挂载，并会把 `REMOTE_CONTROL_MODE` / `REMOTE_SERVERS_JSON` 传入容器。推荐主服务器开启 `PRIMARY_SERVER=true`、远程服务器关闭 `ENABLE_BOT_POLLING`，只保留本地更新监控和 SSH RPC 能力。
 
-**适用场景：** 主服务器有公网 IP，其他服务器可访问
+#### 方式二：NFS 共享状态（兼容旧模式）
+
+**适用场景：** 需要兼容旧的共享 `server_registry.json` / `update_state.json` / `command_queue.json` 工作流。保留该模式，但不再作为默认推荐，因为当 NFS 卡死时会直接阻塞健康检查和远程任务。
 
 ```bash
 # 1. 主服务器配置 NFS（同上）
@@ -205,7 +194,32 @@ volumes:
 | `CLEANUP` | 自动更新成功后清理旧镜像 | true | ❌ |
 | `ENABLE_ROLLBACK` | 更新失败时自动回滚 | true | ❌ |
 | `MONITORED_CONTAINERS` | 固定监控名单，逗号或空格分隔 | 空 | ❌ |
+| `REMOTE_CONTROL_MODE` | 远程控制模式：`auto`/`ssh`/`queue` | auto | ❌ |
+| `REMOTE_SERVERS_JSON` | 主服务器远程节点配置，JSON 数组 | `[]` | ❌ |
+| `SSH_CONNECT_TIMEOUT` | SSH 建连超时（秒） | 15 | ❌ |
+| `SSH_COMMAND_TIMEOUT` | SSH 远程命令超时（秒） | 300 | ❌ |
+| `REMOTE_CACHE_TTL` | 远程状态缓存时间（秒） | 15 | ❌ |
 | `HEALTHCHECK_MAX_AGE` | 健康检查允许的最大心跳延迟（秒） | 120 | ❌ |
+
+### `REMOTE_SERVERS_JSON` 示例
+
+```json
+[
+  {
+    "name": "154VPS",
+    "transport": "ssh",
+    "host": "100.64.1.20",
+    "user": "root",
+    "port": 22,
+    "monitor_container": "watchtower-notifier-154",
+    "identity_file": "/ssh/id_ed25519"
+  },
+  {
+    "name": "旧NFS节点",
+    "transport": "queue"
+  }
+]
+```
 
 ### 监控特定容器
 
@@ -257,9 +271,10 @@ docker compose down
 │  更新检测调度器   │ ← 定期拉取镜像并比较当前容器镜像 ID
 └────────┬────────┘
          │
+         ├─→ 本地记录 update_state / health_status
+         ├─→ 远程优先通过 SSH + Tailscale 实时获取 inventory / 执行 RPC
+         ├─→ 未配置 SSH 时回退到共享 server_registry / command_queue
          ├─→ 发现新版本后按策略自动更新或仅通知
-         ├─→ 失败时自动回滚到旧镜像
-         ├─→ 记录 update_state / server_registry / health_status
          └─→ 通过 Telegram 发送去重后的状态通知
 ```
 
@@ -295,16 +310,22 @@ ls -la /var/run/docker.sock
 df -h
 ```
 
-### 多服务器数据不同步
+### 多服务器数据不同步 / 远程任务卡住
 
 ```bash
-# 测试 NFS 连接
+# 优先检查 SSH 直连
+docker exec watchtower-notifier ssh -o BatchMode=yes -i /ssh/id_ed25519 root@远程TailscaleIP "docker ps --format '{{.Names}}'"
+
+# 查看远程 inventory RPC
+docker exec watchtower-notifier python3 /app/monitor.py rpc inventory
+
+# 如果仍在使用旧 NFS 模式，再检查 NFS
 showmount -e NFS服务器IP
 
-# 检查挂载
+# 检查旧模式挂载
 docker exec watchtower-notifier ls -la /data
 
-# 查看共享状态文件
+# 查看旧模式共享状态文件
 docker exec watchtower-notifier sh -c "cat /data/server_registry.json && echo && cat /data/update_state.json && echo && ls -la /data/health_status.*.json"
 ```
 
@@ -319,6 +340,12 @@ docker exec watchtower-notifier sh -c "cat /data/server_registry.json && echo &&
 - 🔄 自动更新支持失败回滚、失败退避重试与成功后清理旧镜像残留
 - 🎯 新增 `AUTO_UPDATE`、`UPDATE_SOURCE`、`UPDATE_RETRY_BACKOFF`、`INITIAL_CHECK_DELAY` 等配置项
 - 📝 同步更新 README 与安装文档中的推荐 `yml`、命令说明和排障示例
+
+### v5.3.4 (2026-04-06)
+- 🔐 新增 `SSH + Tailscale` 远程控制链路，主服务器可直连远程监控容器读取实时状态并执行更新/重启
+- ♻️ 保留旧 `NFS + 共享队列` 兼容模式，可通过 `REMOTE_CONTROL_MODE=queue` 或 `REMOTE_SERVERS_JSON` 中 `transport=queue` 继续使用
+- 🧰 镜像内置 `openssh-client`，Compose 默认挂载 `./ssh:/ssh:ro`
+- 🧪 新增远程配置解析、SSH 分发和 RPC 子命令相关测试
 
 ### v3.5.0 (2025-11-06)
 - ✨ 支持多服务器统一管理
